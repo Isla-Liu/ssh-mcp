@@ -19,9 +19,15 @@ import {
   sanitizePassword,
   escapeCommandForShell,
 } from './utils/shell.js';
-import { gateApproval } from './approval/gate.js';
+import { gateApproval, listPendingApprovals, resolvePendingApproval } from './approval/gate.js';
 import { AuditStore, resolveAuditDir, yoloApproval } from './audit/store.js';
 import { AuditTool } from './audit/types.js';
+import { startWebUI } from './webui/server.js';
+import type {
+  ManualApprovalQueue,
+  PendingApproval as WebUIPendingApproval,
+  ApprovalDecision as WebUIApprovalDecision,
+} from './webui/types.js';
 
 // Re-exports for backward compatibility with existing tests.
 export { SSHConnectionManager, escapeCommandForShell };
@@ -158,6 +164,9 @@ const TRANSPORT_MCP_FLAG = argvConfig['transport-mcp']; // 'stdio' | 'http' | un
 const HTTP_BIND_FLAG = argvConfig['http-bind'];
 const HTTP_PORT_FLAG = argvConfig['http-port'];
 const HTTP_TOKEN_ENV_FLAG = argvConfig['http-token-env'];
+
+// WebUI CLI override. CLI > TOML > default (off).
+const WEBUI_FLAG = argvConfig['webui'] !== undefined && argvConfig['webui'] !== 'false';
 
 const legacyFlagNames = [
   'host', 'user', 'password', 'key', 'kerberos', 'transport',
@@ -700,8 +709,40 @@ export async function execSshCommand(
 // Server lifecycle
 // =============================================================================
 
+/**
+ * Adapter: bridge the in-process approval gate to the WebUI's ManualApprovalQueue
+ * shape. WebUI calls list()/resolve(); the active approval engine (set by the
+ * approval boot path) owns the actual pending map.
+ *
+ * Note: this card does not introduce an enqueue/resolve event bus yet —
+ * webui SSE 'execution' updates remain audit-driven. Approval enqueue/resolve
+ * events come from the boot wiring once setApprovalEngine() is called with a
+ * ManualApproval that exposes events; until then on(...) is a no-op.
+ */
+function buildWebUIApprovalQueueAdapter(): ManualApprovalQueue {
+  return {
+    list(): WebUIPendingApproval[] {
+      return listPendingApprovals().map(p => ({
+        id: p.id,
+        profile: p.context?.profile?.id ?? 'default',
+        tool: p.context?.tool ?? 'exec',
+        command: p.context?.command ?? '',
+        description: p.context?.description,
+        enqueuedAt: p.enqueued_at,
+      }));
+    },
+    resolve(id: string, decision: WebUIApprovalDecision): boolean {
+      return resolvePendingApproval(id, decision.decision, decision.reason, decision.decided_by);
+    },
+    on(_event, _listener) { /* no-op: enqueue/resolve event bus not yet wired */ },
+    off(_event, _listener) { /* no-op */ },
+  };
+}
+
 async function main() {
   await bootstrapRegistry();
+
+  const webuiHandle = await maybeStartWebUI();
 
   const httpResolved = resolveHttpTransportConfig();
 
@@ -717,6 +758,7 @@ async function main() {
     const cleanup = () => {
       console.error('Shutting down SSH MCP Server (http)...');
       void handle.close().catch(() => { /* ignore */ });
+      if (webuiHandle) void webuiHandle.close().catch(() => { /* ignore */ });
       void registry.closeAll();
       process.exit(0);
     };
@@ -733,6 +775,7 @@ async function main() {
 
   const cleanup = () => {
     console.error('Shutting down SSH MCP Server...');
+    if (webuiHandle) void webuiHandle.close().catch(() => { /* ignore */ });
     void registry.closeAll();
     process.exit(0);
   };
@@ -740,6 +783,43 @@ async function main() {
   process.on('SIGINT', cleanup);
   process.on('SIGTERM', cleanup);
   process.on('exit', () => { void registry.closeAll(); });
+}
+
+/**
+ * Start the WebUI iff CLI --webui or [webui].enabled = true. Default off.
+ * Returns the handle for shutdown, or undefined when WebUI is disabled.
+ *
+ * The audit/execution tail and approval-enqueue event streams are still
+ * stubs — the WebUI ships in opt-in observer mode now and gains live events
+ * once the boot wires an event-emitting ManualApproval engine.
+ */
+async function maybeStartWebUI(): Promise<{ close(): Promise<void> } | undefined> {
+  const tomlWebui = resolvedConfig.webui;
+  const active = WEBUI_FLAG || tomlWebui?.enabled === true;
+  if (!active) return undefined;
+
+  const host = tomlWebui?.host ?? '127.0.0.1';
+  const port = tomlWebui?.port ?? 8088;
+  const authToken = tomlWebui?.auth_token;
+
+  try {
+    const handle = await startWebUI({
+      host,
+      port,
+      authToken,
+      registry: { list: () => registry.list() },
+      queue: buildWebUIApprovalQueueAdapter(),
+      // audit tail wiring lands in a follow-up — see deferred items in handoff.
+    });
+    const tokenStatus = authToken ? 'token required' : 'anonymous loopback';
+    console.error(
+      `SSH MCP WebUI running on http://${handle.address.host}:${handle.address.port}/ — ${tokenStatus}`,
+    );
+    return handle;
+  } catch (err: any) {
+    console.error(`Failed to start WebUI: ${err?.message || err}`);
+    throw err;
+  }
 }
 
 /**
