@@ -1,47 +1,172 @@
-# ssh-mcp first-class TOML config example.
+# ssh-mcp configuration example.
 #
-# Equivalent CLI multi-host shape:
+# Copy this file to one of the discovery paths (the first one found wins):
+#
+#   1. The path you pass via --config=<path>
+#   2. $SSH_MCP_CONFIG
+#   3. $XDG_CONFIG_HOME/ssh-mcp/config.toml
+#      (or ~/.config/ssh-mcp/config.toml when XDG_CONFIG_HOME is unset)
+#   4. ~/.ssh-mcp/config.toml
+#
+# Precedence:  CLI flags > --config TOML > SSH_MCP_CONFIG TOML > discovery TOML > defaults
+#
+# CLI source flags (legacy --host/--user/... or --ssh=<JSON>) SUPPRESS the
+# [[sources]] list below — they don't merge. Top-level sections (server,
+# webui, approval, server.http) still apply when a CLI source is provided,
+# so you can use legacy flags AND keep your [server.http] / [audit] config
+# in TOML.
+#
+# Equivalent CLI multi-host shape for two of the sources below:
 #   --ssh='{"name":"prod-bastion","host":"bastion.example.com","port":22,"user":"aduser@EXAMPLE.INTERNAL","auth":"kerberos"}'
 #   --ssh='{"name":"lab","host":"lab.internal","user":"root","auth":"key","keyPath":"~/.ssh/lab_ed25519","sudoPassword":"..."}'
+#
+# Anywhere this file accepts a secret-bearing string ("password", "sudo_password",
+# "su_password", "auth_token", "api_key"), you may write `env:NAME` to defer the
+# value to a process environment variable. The string itself never lands on disk.
+# Missing/empty referenced env var → boot fails with a redact-safe error.
+#
+# ---------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------------
+# [server] — global server-side knobs (audit, default HTTP listener, etc.).
+# All fields optional.
+# -----------------------------------------------------------------------------
 [server]
-audit_dir = "~/.ssh-mcp"
+# Where the JSONL audit log lives. Default: ~/.ssh-mcp
+# Files are named executions-YYYYMMDD.jsonl, rotated at 10 MB into .1/.2/...
+audit_dir       = "~/.ssh-mcp"
+# Per-record cap on stdout/stderr bytes (UTF-8). Default: 10000.
 audit_max_bytes = 10000
 
-[webui]
-enabled = false
-host = "127.0.0.1"
-port = 8088
-# auth_token = "env:SSHMCP_WEBUI_TOKEN"  # required when host is non-loopback
+# -----------------------------------------------------------------------------
+# [server.http] — opt-in Streamable HTTP MCP transport.
+#
+# OFF by default. Legacy stdio (one process per MCP client) keeps working
+# unchanged. Activate by either setting enabled=true here, or passing
+# --transport-mcp=http on the CLI (CLI wins).
+#
+# Once active, ssh-mcp serves the MCP protocol at POST/GET/DELETE /mcp on the
+# bound host:port, with a `GET /healthz` probe that bypasses auth.
+#
+# Security model (fail-closed):
+#   - bind != loopback AND env[auth_token_env] empty/unset  →  refuses to boot
+#   - DNS-rebinding protection MUST stay on; this protects allowed_hosts /
+#     origin_allowlist from being silently bypassed by the SDK.
+#   - Bearer is constant-time-compared against env[auth_token_env]. The token
+#     value itself is never read from this file — only the env var NAME is.
+#   - Audit log never carries the bearer; the listener calls
+#     sanitizeAuthHeaders() on any text path the token might touch.
+# -----------------------------------------------------------------------------
+[server.http]
+enabled            = false
+bind               = "127.0.0.1"
+# 8934 matches the org port policy (Hyper-V "_Mcp Servers Allow Wsl only"
+# rule already opens 8931–8939 for the WSL subnet — no firewall change needed).
+port               = 8934
+# Name of the env var that holds the bearer (NOT the value).
+auth_token_env     = "SSH_MCP_HTTP_TOKEN"
+# Allowed Origin headers (defense-in-depth on top of the SDK check).
+origin_allowlist   = ["http://127.0.0.1", "http://localhost"]
+# Optional explicit Host header allowlist. When omitted, the listener derives
+# {127.0.0.1:port, localhost:port, [::1]:port} plus the bind:port if non-loopback.
+# allowed_hosts    = ["127.0.0.1:8934", "localhost:8934"]
+# Per-request socket timeout, ms.
+request_timeout_ms = 60000
 
+# -----------------------------------------------------------------------------
+# [webui] — read-only status surface (profiles, recent executions, pending
+# manual approvals). OFF by default. Required when [approval].mode = "manual"
+# because the queue has no other resolver.
+#
+# Bind is loopback by default. Non-loopback bind REQUIRES auth_token — boot
+# fails otherwise.
+# -----------------------------------------------------------------------------
+[webui]
+enabled    = false
+host       = "127.0.0.1"
+port       = 8088
+# Required when host is non-loopback; supports env:NAME for indirection.
+# auth_token = "env:SSHMCP_WEBUI_TOKEN"
+
+# -----------------------------------------------------------------------------
+# [approval] — gate every exec / sudo-exec call before it reaches transport.
+#
+# Modes:
+#   yolo   — allow everything. Decisions still land in the audit log
+#            with decided_by="yolo".
+#   smart  — ask the LLM at [approval.llm] for a {allow,reason} JSON verdict.
+#            fail-closed (deny on timeout / HTTP error / malformed response)
+#            by default; flip fail_closed=false only with eyes open.
+#   manual — enqueue a PendingApproval, wait up to 5 min for a human to
+#            allow/deny via the WebUI. Requires [webui].enabled = true —
+#            boot fails otherwise (no other resolver exists).
+#
+# Per-source override lives on each [[sources]] entry as [sources.approval].
+# A deny throws McpError(InvalidRequest) at the gate; the command never runs
+# and the audit record carries the deny verdict.
+# -----------------------------------------------------------------------------
 [approval]
-mode = "manual"
+mode        = "manual"
 fail_closed = true
 
+# Only consulted when mode = "smart".
 [approval.llm]
-endpoint = "https://api.openai.com/v1/chat/completions"
-api_key = "env:OPENAI_API_KEY"
-model = "gpt-4o-mini"
+endpoint   = "https://api.openai.com/v1/chat/completions"
+api_key    = "env:OPENAI_API_KEY"
+model      = "gpt-4o-mini"
 timeout_ms = 8000
+# provider = "openai"  # reserved for future Anthropic / Azure shapes.
 
+# -----------------------------------------------------------------------------
+# [[sources]] — one entry per SSH target you want ssh-mcp to expose.
+#
+# Required: id, host, user, auth.
+# Auth modes:
+#   "kerberos" — uses the OpenSSH subprocess (transport=openssh is forced).
+#                Requires a valid TGT in the user's LSA cache / kinit cache.
+#                Use port=22 / port=<n> as needed; FQDN matching the SPN.
+#   "key"      — needs key_path OR private_key. ssh2 transport by default;
+#                set transport="openssh" to use the system ssh binary instead.
+#   "password" — needs password (use env:NAME — secrets in argv leak via
+#                process listings). ssh2 by default; openssh writes a
+#                short-lived SSH_ASKPASS helper when transport="openssh".
+#
+# At most one [[sources]] may set default=true; the registry will route
+# tool calls that omit `connectionName` to that one.
+# -----------------------------------------------------------------------------
 [[sources]]
-id = "prod-bastion"
+id          = "prod-bastion"
 description = "Production jump host. Allowed: read-only diagnostics."
-host = "bastion.example.com"
-port = 22
-user = "aduser@EXAMPLE.INTERNAL"
-auth = "kerberos"
-default = true
+host        = "bastion.example.com"
+port        = 22
+user        = "aduser@EXAMPLE.INTERNAL"
+auth        = "kerberos"
+default     = true
+# gssapi_delegate_credentials = "no"   # "yes" forwards your TGT — trusted hosts only.
+# strict_host_key_checking    = "accept-new"   # yes | no | accept-new (openssh only)
+# known_hosts_file            = "~/.ssh/known_hosts"
+
+# Per-source approval override — wins over the global [approval].mode for this
+# source only. Useful for letting yolo through to a sandboxed lab while keeping
+# bastion on manual.
+[sources.approval]
+mode = "manual"
 
 [[sources]]
-id = "lab"
-description = "Lab box for experiments."
-host = "lab.internal"
-user = "root"
-auth = "key"
-key_path = "~/.ssh/lab_ed25519"
+id            = "lab"
+description   = "Lab box for experiments."
+host          = "lab.internal"
+user          = "root"
+auth          = "key"
+key_path      = "~/.ssh/lab_ed25519"
 sudo_password = "env:LAB_SUDO_PASS"
 
-# Optional per-source approval override for the immediately preceding source.
 [sources.approval]
 mode = "yolo"
+
+[[sources]]
+id       = "legacy-db"
+host     = "db.internal"
+user     = "deploy"
+auth     = "password"
+password = "env:LEGACY_DB_PASSWORD"
