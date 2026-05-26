@@ -1,0 +1,33 @@
+t_4e962fef|ne|blockeddo|ssh-mcp: HTTP MCP transport + Windows Kerberos compatibility (rev 2)
+t_b94988d2|done|planner|EPIC: ssh-mcp-kerberos TOML config, audit logging, approvals, WebUI status
+t_2b983502|done|researcher|R0: research ssh-mcp-kerberos and dbhub TOML/status patterns
+t_08647b01|archived|planner|P1: design TOML config, audit log, approval engine, WebUI status contract
+t_278be576|archived|reviewer|V1: security review implementation design before coding
+t_144d7c10|archived|documenter|D0: draft README/examples for TOML logging and approval modes
+t_9cbacb2a|archived|developer-general|DEV: implement TOML config, audit logs, approvals, and WebUI status
+t_e5df6872|blocked|reviewer|V2: final acceptance review for ssh-mcp TOML/logging/approval/WebUI feature
+t_211f6446|todo|fleet-archiver|CLOSE: ssh-mcp-kerberos
+t_2d87e8fa|done|developer-general|ssh-mcp: TOML multi-profile config loader + precedence
+t_67320e65|done|developer-general|ssh-mcp: command audit log (~/.ssh-mcp, JSONL, redaction, rotation)
+t_c857745f|done|developer-general|ssh-mcp: approval engine (yolo/smart/manual) with fail-closed smart mode
+t_4e2a635b|done|developer-general|ssh-mcp: WebUI status surface (profiles, executions, approvals, SSE)
+t_5d02508b|todo|developer-general|ssh-mcp: e2e smoke (TOML + audit + approval + WebUI via testcontainers)
+t_310c0ec1|todo|developer-general|ssh-mcp: docs + ssh-mcp.toml.example
+t_50cb0f90|done|reviewer|REVIEW: toml-config (t_2d87e8fa)
+t_29114a14|done|reviewer|REVIEW: audit-log (t_67320e65)
+t_2366a62d|done|reviewer|REVIEW: approval (t_c857745f)
+t_fa50ed7d|done|reviewer|REVIEW: webui-status (t_4e2a635b)
+t_a0d392f1|todo|reviewer|S1: consolidated security audit before e2e
+t_a3c8b5e1|done|researcher|R1: HTTP MCP transport + Windows Kerberos deployment research
+t_00777089|done|planner|P2: design HTTP MCP transport + Windows Kerberos integration
+t_a60efb40|archived|developer-general|ssh-mcp: HTTP MCP transport + Windows Kerberos compatibility
+t_b149430f|archived|reviewer|REVIEW: http-transport + windows kerberos
+t_58c0e613|done|documenter|ssh-mcp: Windows-host HTTP MCP smoke runbook
+t_b253463f|archived|documenter|ssh-mcp: Windows service registration .bat (deployment option b)
+t_80035a6b|todo|documenter|ssh-mcp: migration guide for StandaloneMcpServers.ps1 → TOML
+t_e33d1d5e|done|documenter|ssh-mcp: Windows Task Scheduler register .bat (deployment option a only)
+t_f8036377|done|reviewer|SIBLING REVIEW: toml-config (t_2d87e8fa)
+t_66e61c98|done|reviewer|SIBLING REVIEW: audit-log (t_67320e65)
+t_a2698fcc|done|reviewer|SIBLING REVIEW: approval-engine (t_c857745f)
+t_b6b0762e|done|reviewer|SIBLING REVIEW: webui-status (t_4e2a635b)
+t_0c08267c|todo|reviewer|REVIEW: http-transport + windows kerberos (rev 2)

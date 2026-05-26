@@ -1,0 +1,3 @@
+Error: in prepare, no such column: data
+  SELECT created_at, task_id, kind, COALESCE(data, '{}') FROM task_events ORDER 
+                               error here ---^
