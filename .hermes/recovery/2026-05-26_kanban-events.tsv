@@ -1,3 +1,195 @@
-Error: in prepare, no such column: data
-  SELECT created_at, task_id, kind, COALESCE(data, '{}') FROM task_events ORDER 
-                               error here ---^
+1779696964|t_b94988d2|created|{"assignee": "planner", "status": "ready", "parents": [], "tenant": null, "branch_name": null, "skills": null}
+1779697014|t_b94988d2|claimed|{"lock": "K-514010200546:476", "expires": 1779697914, "run_id": 1}
+1779697014|t_b94988d2|spawned|{"pid": 27464}
+1779697104|t_2b983502|created|{"assignee": "researcher", "status": "todo", "parents": ["t_b94988d2"], "tenant": null, "branch_name": null, "skills": null}
+1779697104|t_08647b01|created|{"assignee": "planner", "status": "todo", "parents": ["t_2b983502"], "tenant": null, "branch_name": null, "skills": null}
+1779697105|t_278be576|created|{"assignee": "reviewer", "status": "todo", "parents": ["t_08647b01"], "tenant": null, "branch_name": null, "skills": null}
+1779697105|t_144d7c10|created|{"assignee": "documenter", "status": "todo", "parents": ["t_278be576"], "tenant": null, "branch_name": null, "skills": null}
+1779697105|t_9cbacb2a|created|{"assignee": "developer-general", "status": "todo", "parents": ["t_144d7c10"], "tenant": null, "branch_name": "feat/ssh-mcp-toml-approvals-webui", "skills": null}
+1779697106|t_9cbacb2a|linked|{"parent": "t_278be576", "child": "t_9cbacb2a"}
+1779697106|t_e5df6872|created|{"assignee": "reviewer", "status": "todo", "parents": ["t_9cbacb2a"], "tenant": null, "branch_name": null, "skills": null}
+1779697106|t_211f6446|created|{"assignee": "fleet-archiver", "status": "todo", "parents": ["t_e5df6872"], "tenant": null, "branch_name": null, "skills": null}
+1779697214|t_2d87e8fa|created|{"assignee": "developer-general", "status": "todo", "parents": ["t_b94988d2"], "tenant": null, "branch_name": null, "skills": null}
+1779697215|t_67320e65|created|{"assignee": "developer-general", "status": "todo", "parents": ["t_b94988d2"], "tenant": null, "branch_name": null, "skills": null}
+1779697217|t_c857745f|created|{"assignee": "developer-general", "status": "todo", "parents": ["t_b94988d2"], "tenant": null, "branch_name": null, "skills": null}
+1779697243|t_4e2a635b|created|{"assignee": "developer-general", "status": "todo", "parents": ["t_b94988d2"], "tenant": null, "branch_name": null, "skills": null}
+1779697245|t_5d02508b|created|{"assignee": "developer-general", "status": "todo", "parents": ["t_b94988d2", "t_2d87e8fa", "t_67320e65", "t_c857745f"], "tenant": null, "branch_name": null, "skills": null}
+1779697259|t_5d02508b|linked|{"parent": "t_4e2a635b", "child": "t_5d02508b"}
+1779697261|t_310c0ec1|created|{"assignee": "developer-general", "status": "todo", "parents": ["t_b94988d2", "t_5d02508b"], "tenant": null, "branch_name": null, "skills": null}
+1779697273|t_b94988d2|completed|{"result_len": 0, "summary": "Planned ssh-mcp-kerberos TOML+audit+approval+WebUI epic. Plan saved at .hermes/plans/2026-05-25_ssh-mcp-toml-audit-approvals-webui.md. Fanned out into six developer-general sub-tasks linked as children of t_b94988d2: toml-config (t_2d87e8fa), audit-log (t_67320e65), approval-engine (t_c857745f), webui-status (t_4e2a635b), e2e-smoke (t_5d02508b, gated on the four above), docs-examples (t_310c0ec1, ", "verified_cards": ["t_2d87e8fa", "t_67320e65", "t_c857745f", "t_4e2a635b", "t_5d02508b", "t_310c0ec1"]}
+1779697273|t_2b983502|promoted|{}
+1779697273|t_2d87e8fa|promoted|{}
+1779697273|t_67320e65|promoted|{}
+1779697273|t_c857745f|promoted|{}
+1779697273|t_4e2a635b|promoted|{}
+1779697314|t_2b983502|claimed|{"lock": "K-514010200546:476", "expires": 1779698214, "run_id": 2}
+1779697315|t_2b983502|spawned|{"pid": 30723}
+1779697315|t_2d87e8fa|claimed|{"lock": "K-514010200546:476", "expires": 1779698215, "run_id": 3}
+1779697315|t_2d87e8fa|spawned|{"pid": 30724}
+1779697315|t_67320e65|claimed|{"lock": "K-514010200546:476", "expires": 1779698215, "run_id": 4}
+1779697315|t_67320e65|spawned|{"pid": 30725}
+1779697315|t_c857745f|claimed|{"lock": "K-514010200546:476", "expires": 1779698215, "run_id": 5}
+1779697315|t_c857745f|spawned|{"pid": 30726}
+1779697315|t_4e2a635b|claimed|{"lock": "K-514010200546:476", "expires": 1779698215, "run_id": 6}
+1779697315|t_4e2a635b|spawned|{"pid": 30727}
+1779697577|t_2b983502|completed|{"result_len": 0, "summary": "R0 research complete. Read ssh-mcp-kerberos src (559-line index.ts, transport registry+factory, ssh2/openssh transports, tests) and dbhub src (TOML loader, types/config.ts, server.ts, api/sources.ts, requests/store.ts, config-watcher.ts, openapi.yaml). Findings written to .hermes/research/R0-ssh-mcp-dbhub-findings.md covering: (1) ssh-mcp arch map + file paths, (2) existing 3 MCP tools (exec/sudo-", "artifacts": ["/home/islaliu/Repositories/ssh-mcp-kerberos/.hermes/research/R0-ssh-mcp-dbhub-findings.md"]}
+1779697577|t_08647b01|promoted|{}
+1779697615|t_08647b01|claimed|{"lock": "K-514010200546:476", "expires": 1779698515, "run_id": 7}
+1779697615|t_08647b01|spawned|{"pid": 37478}
+1779697701|t_e5df6872|unlinked|{"parent": "t_9cbacb2a", "child": "t_e5df6872"}
+1779697701|t_e5df6872|promoted|{}
+1779697701|t_9cbacb2a|archived|{}
+1779697701|t_144d7c10|archived|{}
+1779697701|t_278be576|archived|{}
+1779697701|t_b94988d2|commented|{"author": "orchestrator", "len": 496}
+1779697702|t_2d87e8fa|commented|{"author": "orchestrator", "len": 470}
+1779697702|t_67320e65|commented|{"author": "orchestrator", "len": 470}
+1779697702|t_c857745f|commented|{"author": "orchestrator", "len": 470}
+1779697703|t_4e2a635b|commented|{"author": "orchestrator", "len": 470}
+1779697735|t_e5df6872|claimed|{"lock": "K-514010200546:476", "expires": 1779698635, "run_id": 8}
+1779697735|t_e5df6872|spawned|{"pid": 39041}
+1779697754|t_50cb0f90|created|{"assignee": "reviewer", "status": "todo", "parents": ["t_2d87e8fa"], "tenant": null, "branch_name": null, "skills": null}
+1779697754|t_29114a14|created|{"assignee": "reviewer", "status": "todo", "parents": ["t_67320e65"], "tenant": null, "branch_name": null, "skills": null}
+1779697755|t_2366a62d|created|{"assignee": "reviewer", "status": "todo", "parents": ["t_c857745f"], "tenant": null, "branch_name": null, "skills": null}
+1779697755|t_fa50ed7d|created|{"assignee": "reviewer", "status": "todo", "parents": ["t_4e2a635b"], "tenant": null, "branch_name": null, "skills": null}
+1779697756|t_a0d392f1|created|{"assignee": "reviewer", "status": "todo", "parents": ["t_2d87e8fa"], "tenant": null, "branch_name": null, "skills": null}
+1779697756|t_a0d392f1|linked|{"parent": "t_67320e65", "child": "t_a0d392f1"}
+1779697756|t_a0d392f1|linked|{"parent": "t_c857745f", "child": "t_a0d392f1"}
+1779697757|t_a0d392f1|linked|{"parent": "t_4e2a635b", "child": "t_a0d392f1"}
+1779697757|t_a0d392f1|linked|{"parent": "t_50cb0f90", "child": "t_a0d392f1"}
+1779697758|t_a0d392f1|linked|{"parent": "t_29114a14", "child": "t_a0d392f1"}
+1779697758|t_a0d392f1|linked|{"parent": "t_2366a62d", "child": "t_a0d392f1"}
+1779697758|t_a0d392f1|linked|{"parent": "t_fa50ed7d", "child": "t_a0d392f1"}
+1779697759|t_5d02508b|linked|{"parent": "t_a0d392f1", "child": "t_5d02508b"}
+1779697759|t_e5df6872|linked|{"parent": "t_310c0ec1", "child": "t_e5df6872"}
+1779697759|t_5d02508b|commented|{"author": "orchestrator", "len": 158}
+1779697760|t_310c0ec1|commented|{"author": "orchestrator", "len": 103}
+1779697760|t_e5df6872|commented|{"author": "orchestrator", "len": 141}
+1779697798|t_08647b01|reclaimed|{"manual": true, "reason": "Redundant: EPIC planner already produced .hermes/plans/2026-05-25_ssh-mcp-toml-audit-approvals-webui.md and fanned out impl cards. Archiving.", "prev_lock": "K-514010200546:476", "prev_pid": 37478, "host_local": true, "termination_attempted": true, "terminated": true, "sigkill": false}
+1779697798|t_08647b01|archived|{}
+1779697802|t_e5df6872|reclaimed|{"manual": true, "reason": "V2 was auto-promoted when the superseded DEV card was archived. Dependencies (docs, security audit) not yet satisfied.", "prev_lock": "K-514010200546:476", "prev_pid": 39041, "host_local": true, "termination_attempted": true, "terminated": true, "sigkill": false}
+1779697802|t_e5df6872|commented|{"author": "agents-manager", "len": 115}
+1779697802|t_e5df6872|blocked|{"reason": "Awaiting docs (t_310c0ec1) and consolidated security audit (t_a0d392f1). Will be unblocked once both PASS."}
+1779698087|t_c857745f|commented|{"author": "developer-general", "len": 2985}
+1779698091|t_c857745f|blocked|{"reason": "review-required: approval engine — yolo/smart/manual with fail-closed default + exec/sudo-exec gating wired. 35/35 new tests green, no regressions vs baseline. Diff at /tmp/approval-engine.diff, commit eb7bd7d on feat/approval-engine."}
+1779698216|t_2d87e8fa|claim_extended|{"reason": "pid_alive", "worker_pid": 30724, "claim_lock": "K-514010200546:476", "claim_expires_was": 1779698215, "claim_expires_now": 1779699116, "last_heartbeat_at": null}
+1779698216|t_67320e65|claim_extended|{"reason": "pid_alive", "worker_pid": 30725, "claim_lock": "K-514010200546:476", "claim_expires_was": 1779698215, "claim_expires_now": 1779699116, "last_heartbeat_at": null}
+1779698216|t_4e2a635b|claim_extended|{"reason": "pid_alive", "worker_pid": 30727, "claim_lock": "K-514010200546:476", "claim_expires_was": 1779698215, "claim_expires_now": 1779699116, "last_heartbeat_at": null}
+1779698260|t_4e2a635b|commented|{"author": "developer-general", "len": 3507}
+1779698265|t_4e2a635b|blocked|{"reason": "review-required: webui status surface shipped on branch wt/webui (commit e76f776). 13/13 new tests pass; pre-existing test/{smoke,description,persistent,sudo-exec} failures require live SSH:2222 and are not regressions. Used node:http instead of express to avoid dep churn — see comment for rationale; reviewer can request switch to express if preferred."}
+1779699118|t_2d87e8fa|claim_extended|{"reason": "pid_alive", "worker_pid": 30724, "claim_lock": "K-514010200546:476", "claim_expires_was": 1779699116, "claim_expires_now": 1779700018, "last_heartbeat_at": null}
+1779699118|t_67320e65|claim_extended|{"reason": "pid_alive", "worker_pid": 30725, "claim_lock": "K-514010200546:476", "claim_expires_was": 1779699116, "claim_expires_now": 1779700018, "last_heartbeat_at": null}
+1779699897|t_2d87e8fa|commented|{"author": "developer-general", "len": 1081}
+1779700019|t_2d87e8fa|claim_extended|{"reason": "pid_alive", "worker_pid": 30724, "claim_lock": "K-514010200546:476", "claim_expires_was": 1779700018, "claim_expires_now": 1779700919, "last_heartbeat_at": null}
+1779700019|t_67320e65|claim_extended|{"reason": "pid_alive", "worker_pid": 30725, "claim_lock": "K-514010200546:476", "claim_expires_was": 1779700018, "claim_expires_now": 1779700919, "last_heartbeat_at": null}
+1779700207|t_2d87e8fa|blocked|{"reason": "review-required: TOML config + precedence"}
+1779700700|t_67320e65|commented|{"author": "developer-general", "len": 1309}
+1779700805|t_67320e65|blocked|{"reason": "review-required: audit log implementation complete; build and npm test passed (86/86), needs reviewer eyes before merge"}
+1779760700|t_50cb0f90|promoted_manual|{"actor": "agents-manager", "reason": null, "forced": true}
+1779760700|t_29114a14|promoted_manual|{"actor": "agents-manager", "reason": null, "forced": true}
+1779760700|t_2366a62d|promoted_manual|{"actor": "agents-manager", "reason": null, "forced": true}
+1779760701|t_fa50ed7d|promoted_manual|{"actor": "agents-manager", "reason": null, "forced": true}
+1779760707|t_50cb0f90|claim_rejected|{"reason": "parents_not_done"}
+1779760707|t_29114a14|claim_rejected|{"reason": "parents_not_done"}
+1779760707|t_2366a62d|claim_rejected|{"reason": "parents_not_done"}
+1779760707|t_fa50ed7d|claim_rejected|{"reason": "parents_not_done"}
+1779761634|t_a3c8b5e1|created|{"assignee": "researcher", "status": "ready", "parents": ["t_b94988d2"], "tenant": null, "branch_name": null, "skills": null}
+1779761635|t_00777089|created|{"assignee": "planner", "status": "todo", "parents": ["t_a3c8b5e1"], "tenant": null, "branch_name": null, "skills": null}
+1779761635|t_a60efb40|created|{"assignee": "developer-general", "status": "todo", "parents": ["t_00777089"], "tenant": null, "branch_name": "feat/ssh-mcp-http-transport", "skills": null}
+1779761636|t_b149430f|created|{"assignee": "reviewer", "status": "todo", "parents": ["t_a60efb40"], "tenant": null, "branch_name": null, "skills": null}
+1779761636|t_a0d392f1|linked|{"parent": "t_a60efb40", "child": "t_a0d392f1"}
+1779761637|t_a0d392f1|linked|{"parent": "t_b149430f", "child": "t_a0d392f1"}
+1779761637|t_58c0e613|created|{"assignee": "documenter", "status": "todo", "parents": ["t_b149430f"], "tenant": null, "branch_name": null, "skills": null}
+1779761638|t_5d02508b|linked|{"parent": "t_58c0e613", "child": "t_5d02508b"}
+1779761638|t_310c0ec1|linked|{"parent": "t_58c0e613", "child": "t_310c0ec1"}
+1779761639|t_b94988d2|commented|{"author": "orchestrator", "len": 438}
+1779761639|t_a0d392f1|commented|{"author": "orchestrator", "len": 304}
+1779761639|t_5d02508b|commented|{"author": "orchestrator", "len": 251}
+1779761669|t_a3c8b5e1|claimed|{"lock": "K-514010200546:476", "expires": 1779762569, "run_id": 10}
+1779761669|t_a3c8b5e1|spawned|{"pid": 7611}
+1779761884|t_a3c8b5e1|completed|{"result_len": 0, "summary": "R1 research complete. Findings written to .hermes/research/2026-05-26_R1_http_transport_windows_kerberos.md covering: stdio-only confirmation at src/index.ts:524, SDK 1.29.0 StreamableHTTPServerTransport API + options (allowedHosts/allowedOrigins/enableDnsRebindingProtection/sessionIdGenerator), ssh2-no-GSSAPI confirmation, Windows in-box ssh.exe = SSPI/LSA (not MIT KfW), bearer-token+loopback+reb", "artifacts": [".hermes/research/2026-05-26_R1_http_transport_windows_kerberos.md"]}
+1779761884|t_00777089|promoted|{}
+1779761910|t_00777089|claimed|{"lock": "K-514010200546:476", "expires": 1779762810, "run_id": 11}
+1779761910|t_00777089|spawned|{"pid": 14241}
+1779761922|t_a3c8b5e1|commented|{"author": "orchestrator", "len": 2731}
+1779761923|t_00777089|commented|{"author": "orchestrator", "len": 2731}
+1779761923|t_b94988d2|commented|{"author": "orchestrator", "len": 385}
+1779761923|t_a60efb40|commented|{"author": "orchestrator", "len": 450}
+1779761924|t_58c0e613|commented|{"author": "orchestrator", "len": 404}
+1779761924|t_b253463f|created|{"assignee": "documenter", "status": "todo", "parents": ["t_58c0e613"], "tenant": null, "branch_name": null, "skills": null}
+1779761924|t_310c0ec1|linked|{"parent": "t_b253463f", "child": "t_310c0ec1"}
+1779761924|t_80035a6b|created|{"assignee": "documenter", "status": "todo", "parents": ["t_310c0ec1"], "tenant": null, "branch_name": null, "skills": null}
+1779762073|t_b253463f|archived|{}
+1779762074|t_e33d1d5e|created|{"assignee": "documenter", "status": "todo", "parents": ["t_58c0e613"], "tenant": null, "branch_name": null, "skills": null}
+1779762074|t_310c0ec1|linked|{"parent": "t_e33d1d5e", "child": "t_310c0ec1"}
+1779762075|t_b94988d2|commented|{"author": "orchestrator", "len": 292}
+1779762082|t_a60efb40|commented|{"author": "planner", "len": 2954}
+1779762098|t_00777089|completed|{"result_len": 0, "summary": "P2 design complete. Plan saved at .hermes/plans/2026-05-26_P2_http-mcp-transport_windows-kerberos.md. Decision: Option B (in-process Streamable HTTP via SDK's StreamableHTTPServerTransport), not the mcp-proxy bridge — keeps ssh-mcp in control of bearer/origin/rebinding/audit-transport semantics and lets stateful sessions reuse the warm ssh registry across Kerberos calls. Plan covers: file-level im"}
+1779762098|t_a60efb40|promoted|{}
+1779762150|t_a60efb40|claimed|{"lock": "K-514010200546:476", "expires": 1779763050, "run_id": 12}
+1779762150|t_a60efb40|spawned|{"pid": 19626}
+1779762204|t_2d87e8fa|commented|{"author": "orchestrator", "len": 423}
+1779762205|t_f8036377|created|{"assignee": "reviewer", "status": "ready", "parents": [], "tenant": null, "branch_name": null, "skills": null}
+1779762205|t_67320e65|commented|{"author": "orchestrator", "len": 421}
+1779762205|t_66e61c98|created|{"assignee": "reviewer", "status": "ready", "parents": [], "tenant": null, "branch_name": null, "skills": null}
+1779762206|t_c857745f|commented|{"author": "orchestrator", "len": 427}
+1779762206|t_a2698fcc|created|{"assignee": "reviewer", "status": "ready", "parents": [], "tenant": null, "branch_name": null, "skills": null}
+1779762206|t_4e2a635b|commented|{"author": "orchestrator", "len": 417}
+1779762207|t_b6b0762e|created|{"assignee": "reviewer", "status": "ready", "parents": [], "tenant": null, "branch_name": null, "skills": null}
+1779762207|t_a0d392f1|linked|{"parent": "t_f8036377", "child": "t_a0d392f1"}
+1779762207|t_a0d392f1|linked|{"parent": "t_66e61c98", "child": "t_a0d392f1"}
+1779762208|t_a0d392f1|linked|{"parent": "t_a2698fcc", "child": "t_a0d392f1"}
+1779762208|t_a0d392f1|linked|{"parent": "t_b6b0762e", "child": "t_a0d392f1"}
+1779762210|t_f8036377|claimed|{"lock": "K-514010200546:476", "expires": 1779763110, "run_id": 13}
+1779762210|t_f8036377|spawned|{"pid": 20162}
+1779762210|t_66e61c98|claimed|{"lock": "K-514010200546:476", "expires": 1779763110, "run_id": 14}
+1779762210|t_66e61c98|spawned|{"pid": 20163}
+1779762210|t_a2698fcc|claimed|{"lock": "K-514010200546:476", "expires": 1779763110, "run_id": 15}
+1779762210|t_a2698fcc|spawned|{"pid": 20164}
+1779762210|t_b6b0762e|claimed|{"lock": "K-514010200546:476", "expires": 1779763110, "run_id": 16}
+1779762210|t_b6b0762e|spawned|{"pid": 20165}
+1779762257|t_a60efb40|commented|{"author": "developer-general", "len": 2759}
+1779762264|t_a60efb40|blocked|{"reason": "Pre-start: workspace path points at hermes-agent (wrong repo) and doesn't exist; plan requires extending three sibling branches (feat/toml-config, wt/audit-log, feat/approval-engine) that haven't been integrated. Need orchestrator to pick (a) create integration-branch worktree under /home/islaliu/Repositories/ssh-mcp-kerberos.wt/, (b) authorize stub-and-defer, or (c) wait on parent cards. Recommended (a). Full context in comment."}
+1779762323|t_29114a14|commented|{"author": "reviewer", "len": 2701}
+1779762324|t_67320e65|commented|{"author": "reviewer", "len": 821}
+1779762327|t_c857745f|commented|{"author": "reviewer", "len": 1117}
+1779762328|t_2366a62d|commented|{"author": "reviewer", "len": 2754}
+1779762334|t_66e61c98|completed|{"result_len": 0, "summary": "Sibling review of audit-log producer t_67320e65: PASS. Verified all 6 acceptance criteria against worktree code (default ~/.ssh-mcp, JSONL append, 10MB size-roll, day-roll, retain 10, redactor for password/PEM/AWS/JWT shapes, stdout/stderr UTF-8-safe cap with truncated flag, audit-write failure non-fatal). Re-ran vitest on audit __tests__ + openssh.unit (28/28 passed). YELLOW (non-blocking): no st"}
+1779762337|t_b6b0762e|commented|{"author": "reviewer", "len": 4035}
+1779762338|t_a2698fcc|completed|{"result_len": 0, "summary": "PASS — approval-engine (t_c857745f, commit eb7bd7d) verified read-only. All 6 acceptance criteria met with file:line evidence; 35/35 approval tests re-run green; no secret leakage; legacy behavior preserved via synthetic-allow gate. One minor informational note (synthetic legacy decision tags mode:'yolo'; decided_by disambiguates). PASS comment posted on producer t_c857745f; full evidence dump pos"}
+1779762338|t_fa50ed7d|commented|{"author": "reviewer", "len": 999}
+1779762339|t_4e2a635b|commented|{"author": "reviewer", "len": 728}
+1779762355|t_b6b0762e|completed|{"result_len": 0, "summary": "PASS-with-caveats. Reviewed webui-status @ e76f776 in /home/islaliu/Repositories/ssh-mcp-kerberos.wt/webui. 13/13 new tests pass (vitest), all 8 acceptance criteria met (default 127.0.0.1, fatal non-loopback w/o authToken, Bearer on /api/*, ?token= for SSE, manual round-trip integration test, no credential leakage). YELLOW: (1) node:http instead of Express — permitted by pass criteria; (2) src/ind"}
+1779762540|t_50cb0f90|commented|{"author": "reviewer", "len": 5023}
+1779762542|t_2d87e8fa|commented|{"author": "reviewer", "len": 1853}
+1779762556|t_f8036377|completed|{"result_len": 0, "summary": "Sibling reviewer for toml-config (t_2d87e8fa): PASS-with-caveats. All 5 acceptance criteria verified with code+test evidence. 38/38 TOML-specific tests pass + 31/31 pre-existing unit tests pass; 29 full-suite failures are pre-existing ECONNREFUSED on the SSH testcontainer (not a regression). YELLOW caveats are documentation/example issues deferred to docs-examples and approval-engine cards. Commen"}
+1779762874|t_66e61c98|commented|{"author": "orchestrator", "len": 787}
+1779762875|t_a60efb40|archived|{}
+1779762875|t_b149430f|promoted|{}
+1779762875|t_b149430f|archived|{}
+1779762875|t_58c0e613|promoted|{}
+1779762922|t_58c0e613|claimed|{"lock": "K-514010200546:473", "expires": 1779763822, "run_id": 17}
+1779762922|t_58c0e613|spawned|{"pid": 6093}
+1779762943|t_4e962fef|created|{"assignee": "developer-general", "status": "ready", "parents": ["t_00777089"], "tenant": null, "branch_name": null, "skills": null}
+1779762943|t_0c08267c|created|{"assignee": "reviewer", "status": "todo", "parents": ["t_4e962fef"], "tenant": null, "branch_name": null, "skills": null}
+1779762943|t_a0d392f1|linked|{"parent": "t_4e962fef", "child": "t_a0d392f1"}
+1779762944|t_a0d392f1|linked|{"parent": "t_0c08267c", "child": "t_a0d392f1"}
+1779762944|t_58c0e613|commented|{"author": "orchestrator", "len": 473}
+1779762944|t_80035a6b|commented|{"author": "orchestrator", "len": 390}
+1779762982|t_4e962fef|claimed|{"lock": "K-514010200546:473", "expires": 1779763882, "run_id": 18}
+1779762982|t_4e962fef|spawned|{"pid": 6585}
+1779763028|t_4e962fef|commented|{"author": "orchestrator", "len": 1165}
+1779763028|t_2d87e8fa|unblocked|{}
+1779763029|t_67320e65|unblocked|{}
+1779763029|t_c857745f|unblocked|{}
+1779763029|t_4e2a635b|unblocked|{}
+1779763029|t_2d87e8fa|completed|{"result_len": 235, "summary": "PASS-with-caveats per sibling review t_f8036377. 38/38 TOML tests + 31/31 pre-existing unit tests pass. YELLOW: docs/examples deferred to docs cards. Commit 6e0df80 on feat/toml-config branch; merged into integration branch as b776e7a."}
+1779763029|t_50cb0f90|promoted|{}
+1779763030|t_67320e65|completed|{"result_len": 310, "summary": "PASS per sibling review t_66e61c98. 28/28 audit + openssh.unit tests pass. Commit 352287e on wt/audit-log branch (committed by AM during integration because dev left it dirty). YELLOW: no strict-mode toggle; TOML wiring deferred to integration card. To be merged into integration by DEV_HTTP rev2 (t_4e962fef)."}
+1779763030|t_29114a14|promoted|{}
+1779763030|t_c857745f|completed|{"result_len": 191, "summary": "PASS per sibling review t_a2698fcc. 35/35 approval tests pass; no secret leakage; legacy behavior preserved. Commit eb7bd7d on feat/approval-engine; merged into integration branch as b776e7a."}
+1779763030|t_2366a62d|promoted|{}
+1779763030|t_4e2a635b|completed|{"result_len": 336, "summary": "PASS-with-caveats per sibling review t_b6b0762e. 13/13 webui tests pass; all 8 acceptance criteria met. YELLOW: node:http accepted (user OK with this); src/index.ts boot wiring deferred to integration card. Commit e76f776 on wt/webui — NOT yet merged into integration branch (DEV_HTTP rev2 owns that merge after audit-log merge clears)."}
+1779763030|t_fa50ed7d|promoted|{}
+1779763031|t_50cb0f90|completed|{"result_len": 219, "summary": "Audit trace satisfied: sibling reviewer t_f8036377 (no-parent runnable) executed the actual READ-ONLY review of producer per blocked-producer-reviewer pattern. Conclusion mirrored here. See t_f8036377 for full evidence."}
+1779763031|t_29114a14|completed|{"result_len": 219, "summary": "Audit trace satisfied: sibling reviewer t_66e61c98 (no-parent runnable) executed the actual READ-ONLY review of producer per blocked-producer-reviewer pattern. Conclusion mirrored here. See t_66e61c98 for full evidence."}
