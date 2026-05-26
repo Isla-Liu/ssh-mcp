@@ -21,7 +21,10 @@ export { ManualApproval, ManualApprovalDisabledError } from './manual.js';
 export {
   ApprovalDispatcher,
   buildApprovalEngine,
+  buildApprovalEngineFromConfig,
   type BuildApprovalEngineOptions,
+  type BuildEngineFromConfigInput,
+  type BuildEngineFromConfigOptions,
 } from './engine.js';
 export {
   setApprovalEngine,

@@ -19,14 +19,26 @@ import {
   sanitizePassword,
   escapeCommandForShell,
 } from './utils/shell.js';
-import { gateApproval, listPendingApprovals, resolvePendingApproval } from './approval/gate.js';
+import {
+  gateApproval,
+  listPendingApprovals,
+  resolvePendingApproval,
+  setApprovalEngine,
+  buildApprovalEngineFromConfig,
+  ApprovalDispatcher,
+  ManualApprovalDisabledError,
+  type ApprovalDecision,
+  type ApprovalMode,
+  type BuildEngineFromConfigInput,
+} from './approval/index.js';
 import { AuditStore, resolveAuditDir, yoloApproval } from './audit/store.js';
-import { AuditTool } from './audit/types.js';
+import type { AuditApprovalSection, AuditTool } from './audit/types.js';
 import { startWebUI } from './webui/server.js';
 import type {
   ManualApprovalQueue,
   PendingApproval as WebUIPendingApproval,
   ApprovalDecision as WebUIApprovalDecision,
+  AuditTail as WebUIAuditTail,
 } from './webui/types.js';
 
 // Re-exports for backward compatibility with existing tests.
@@ -315,6 +327,16 @@ function resolvedProfileName(connectionName?: string): string {
   return connectionName ?? registry.getDefaultName() ?? 'default';
 }
 
+function approvalToAuditSection(decision: ApprovalDecision): AuditApprovalSection {
+  return {
+    mode: decision.mode,
+    decision: decision.decision,
+    reason: decision.reason,
+    decided_at: decision.decided_at,
+    decided_by: decision.decided_by,
+  };
+}
+
 function auditExecution(params: {
   tool: AuditTool;
   profile: string;
@@ -323,18 +345,25 @@ function auditExecution(params: {
   startedAt: number;
   result?: ExecResult;
   error?: unknown;
+  approval?: ApprovalDecision;
   store?: AuditStore;
 }): void {
   const now = new Date();
   const durationMs = Math.max(0, Date.now() - params.startedAt);
   const store = params.store ?? auditStore;
+  // Prefer the real approval decision when the gate returned one. On error
+  // before the gate ran (or when no engine is wired) fall back to the yolo
+  // placeholder so the record still serializes.
+  const approvalSection: AuditApprovalSection = params.approval
+    ? approvalToAuditSection(params.approval)
+    : yoloApproval(now);
   try {
     store.append({
       profile: params.profile,
       tool: params.tool,
       command: params.command,
       description: params.description,
-      approval: yoloApproval(now),
+      approval: approvalSection,
       exec: params.result
         ? {
             stdout: params.result.stdout ?? '',
@@ -365,6 +394,7 @@ export async function executeAuditedTransportCommand(input: {
   timeoutMs?: number;
   sudoPassword?: string;
   store: AuditStore;
+  approval?: ApprovalDecision;
 }) {
   const sanitizedCommand = sanitizeCommand(input.command);
   const commandWithDescription = input.description
@@ -386,6 +416,7 @@ export async function executeAuditedTransportCommand(input: {
     startedAt,
     result,
     store: input.store,
+    approval: input.approval,
   });
   return resultToMcpContent(result);
 }
@@ -449,9 +480,10 @@ server.tool(
     const profile = resolvedProfileName(connectionName);
     const startedAt = Date.now();
     let audited = false;
+    let approvalDecision: ApprovalDecision | undefined;
     try {
       const t = await registry.get(connectionName);
-      await gateApproval({
+      approvalDecision = await gateApproval({
         profile: { id: connectionName ?? 'default' },
         tool: 'exec',
         command: sanitizedCommand,
@@ -468,11 +500,20 @@ server.tool(
         description,
         startedAt,
         result,
+        approval: approvalDecision,
       });
       audited = true;
       return resultToMcpContent(result);
     } catch (err: any) {
-      if (!audited) auditExecution({ tool: 'exec', profile, command: sanitizedCommand, description, startedAt, error: err });
+      if (!audited) auditExecution({
+        tool: 'exec',
+        profile,
+        command: sanitizedCommand,
+        description,
+        startedAt,
+        error: err,
+        approval: approvalDecision,
+      });
       if (err instanceof McpError) throw err;
       throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
     }
@@ -493,9 +534,10 @@ if (!DISABLE_SUDO) {
       const profile = resolvedProfileName(connectionName);
       const startedAt = Date.now();
       let audited = false;
+      let approvalDecision: ApprovalDecision | undefined;
       try {
         const t = await registry.get(connectionName);
-        await gateApproval({
+        approvalDecision = await gateApproval({
           profile: { id: connectionName ?? 'default' },
           tool: 'sudo-exec',
           command: sanitizedCommand,
@@ -521,11 +563,20 @@ if (!DISABLE_SUDO) {
           description,
           startedAt,
           result,
+          approval: approvalDecision,
         });
         audited = true;
         return resultToMcpContent(result);
       } catch (err: any) {
-        if (!audited) auditExecution({ tool: 'sudo-exec', profile, command: sanitizedCommand, description, startedAt, error: err });
+        if (!audited) auditExecution({
+          tool: 'sudo-exec',
+          profile,
+          command: sanitizedCommand,
+          description,
+          startedAt,
+          error: err,
+          approval: approvalDecision,
+        });
         if (err instanceof McpError) throw err;
         throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
       }
@@ -711,15 +762,17 @@ export async function execSshCommand(
 
 /**
  * Adapter: bridge the in-process approval gate to the WebUI's ManualApprovalQueue
- * shape. WebUI calls list()/resolve(); the active approval engine (set by the
- * approval boot path) owns the actual pending map.
- *
- * Note: this card does not introduce an enqueue/resolve event bus yet —
- * webui SSE 'execution' updates remain audit-driven. Approval enqueue/resolve
- * events come from the boot wiring once setApprovalEngine() is called with a
- * ManualApproval that exposes events; until then on(...) is a no-op.
+ * shape. The dispatcher (set by setApprovalEngine) is the source of truth for
+ * pending items AND for enqueue/resolve events that drive the WebUI SSE feed.
  */
-function buildWebUIApprovalQueueAdapter(): ManualApprovalQueue {
+function buildWebUIApprovalQueueAdapter(engine: ApprovalDispatcher | null): ManualApprovalQueue {
+  // Listener bookkeeping: WebUI's SseHub registers exactly one enqueue +
+  // one resolve listener on attach. The off() handler must remove the same
+  // function references it was registered with, so we forward listeners
+  // through wrapper Maps.
+  const enqWrappers = new Map<Function, (p: any) => void>();
+  const resWrappers = new Map<Function, (p: any, d: any) => void>();
+
   return {
     list(): WebUIPendingApproval[] {
       return listPendingApprovals().map(p => ({
@@ -734,15 +787,160 @@ function buildWebUIApprovalQueueAdapter(): ManualApprovalQueue {
     resolve(id: string, decision: WebUIApprovalDecision): boolean {
       return resolvePendingApproval(id, decision.decision, decision.reason, decision.decided_by);
     },
-    on(_event, _listener) { /* no-op: enqueue/resolve event bus not yet wired */ },
-    off(_event, _listener) { /* no-op */ },
+    on(event: any, listener: any) {
+      if (!engine) return;
+      if (event === 'enqueue') {
+        const wrap = (p: any) => (listener as (p: WebUIPendingApproval) => void)({
+          id: p.id,
+          profile: p.context?.profile?.id ?? 'default',
+          tool: p.context?.tool ?? 'exec',
+          command: p.context?.command ?? '',
+          description: p.context?.description,
+          enqueuedAt: p.enqueued_at,
+        });
+        enqWrappers.set(listener, wrap);
+        engine.on('enqueue', wrap);
+      } else if (event === 'resolve') {
+        const wrap = (p: any, d: ApprovalDecision) => (listener as (p: WebUIPendingApproval, d: WebUIApprovalDecision) => void)(
+          {
+            id: p.id,
+            profile: p.context?.profile?.id ?? 'default',
+            tool: p.context?.tool ?? 'exec',
+            command: p.context?.command ?? '',
+            description: p.context?.description,
+            enqueuedAt: p.enqueued_at,
+          },
+          { decision: d.decision, reason: d.reason, decided_by: d.decided_by },
+        );
+        resWrappers.set(listener, wrap);
+        engine.on('resolve', wrap);
+      }
+    },
+    off(event, listener) {
+      if (!engine) return;
+      if (event === 'enqueue') {
+        const wrap = enqWrappers.get(listener);
+        if (wrap) {
+          engine.off('enqueue', wrap);
+          enqWrappers.delete(listener);
+        }
+      } else if (event === 'resolve') {
+        const wrap = resWrappers.get(listener);
+        if (wrap) {
+          engine.off('resolve', wrap);
+          resWrappers.delete(listener);
+        }
+      }
+    },
   };
+}
+
+/**
+ * Adapter: bridge the AuditStore to the WebUI's AuditTail shape.
+ * The WebUI's SseHub will subscribe to 'execution' events and read the rolling
+ * tail via .tail(). Mode lookup is overlaid so per-profile filter still works.
+ */
+function buildWebUIAuditTailAdapter(store: AuditStore): WebUIAuditTail {
+  // Convert audit/types AuditRecord (exit_code: number|null) to webui/types
+  // AuditRecord (exit_code?: number) — the WebUI shape omits null exit codes.
+  const toWebUI = (r: any) => ({
+    ts: r.ts,
+    id: r.id,
+    profile: r.profile,
+    tool: r.tool,
+    command: r.command,
+    description: r.description,
+    approval: r.approval,
+    exec: r.exec
+      ? {
+          exit_code: r.exec.exit_code ?? undefined,
+          duration_ms: r.exec.duration_ms,
+          stdout_truncated: r.exec.stdout_truncated,
+          stderr_truncated: r.exec.stderr_truncated,
+          stdout: r.exec.stdout,
+          stderr: r.exec.stderr,
+        }
+      : undefined,
+  });
+  const listenerMap = new Map<Function, (r: any) => void>();
+  return {
+    tail: async (opts) => {
+      const records = await store.tail(opts);
+      return records.map(toWebUI);
+    },
+    on: (event, listener) => {
+      const wrap = (r: any) => listener(toWebUI(r));
+      listenerMap.set(listener, wrap);
+      store.on(event, wrap);
+    },
+    off: (event, listener) => {
+      const wrap = listenerMap.get(listener);
+      if (wrap) {
+        store.off(event, wrap);
+        listenerMap.delete(listener);
+      }
+    },
+  };
+}
+
+/**
+ * Resolve effective approval mode for a given source name. Used by the WebUI
+ * /api/profiles endpoint so each row shows its effective mode honestly.
+ */
+function makeApprovalModeLookup(): (profileName: string) => string {
+  const defaultMode: ApprovalMode = resolvedConfig.approval?.mode ?? 'yolo';
+  const perSource = resolvedConfig.perSourceApproval ?? {};
+  return (name: string) => perSource[name] ?? defaultMode;
+}
+
+/** Decide whether the WebUI will be active at boot. */
+function isWebUIActive(): boolean {
+  const tomlWebui = resolvedConfig.webui;
+  return WEBUI_FLAG || tomlWebui?.enabled === true;
+}
+
+/**
+ * Build the production approval engine from resolvedConfig + boot context.
+ * Returns null only when the legacy CLI path is in use (no [approval] section
+ * at all). In that case the gate falls back to legacy:no-engine allow.
+ *
+ * Throws (fatal at boot):
+ *   - manual mode requested but WebUI is disabled (gate 12 invariant)
+ *   - smart mode requested but [approval.llm] missing endpoint or model
+ */
+function buildProductionApprovalEngine(webuiActive: boolean): ApprovalDispatcher | null {
+  const approvalCfg = resolvedConfig.approval;
+  const perSourceModes = Object.values(resolvedConfig.perSourceApproval ?? {});
+  // If neither TOML approval section nor per-source approval is present, keep
+  // the legacy:no-engine allow path — preserves backward-compatible behaviour
+  // for `--ssh`-only / single-host launches that never knew about TOML.
+  if (!approvalCfg?.mode && perSourceModes.length === 0) {
+    return null;
+  }
+
+  const input: BuildEngineFromConfigInput = {
+    defaultMode: approvalCfg?.mode,
+    fail_closed: approvalCfg?.fail_closed,
+    llm: approvalCfg?.llm,
+    perSourceModes,
+  };
+
+  return buildApprovalEngineFromConfig(input, {
+    manualOpts: { webuiEnabled: webuiActive },
+  });
 }
 
 async function main() {
   await bootstrapRegistry();
 
-  const webuiHandle = await maybeStartWebUI();
+  const webuiActive = isWebUIActive();
+
+  // Boot the approval engine BEFORE the MCP transport so the very first
+  // exec / sudo-exec call is gated by the configured engine.
+  const approvalEngine = buildProductionApprovalEngine(webuiActive);
+  setApprovalEngine(approvalEngine);
+
+  const webuiHandle = await maybeStartWebUI(approvalEngine);
 
   const httpResolved = resolveHttpTransportConfig();
 
@@ -750,9 +948,12 @@ async function main() {
     const handle = await startHttpListener(server, httpResolved.cfg);
     const mode = isMultiHost ? `multi-host (${registry.names().length} servers)` : 'single-host';
     const tokenStatus = httpResolved.tokenPresent ? 'bearer required' : 'anonymous loopback (WARN)';
+    const approvalStatus = approvalEngine
+      ? `approval=${resolvedConfig.approval?.mode ?? 'yolo'}`
+      : 'approval=legacy:no-engine';
     console.error(
       `SSH MCP Server running on HTTP http://${httpResolved.cfg.bind}:${handle.port}/mcp ` +
-      `— ${mode} — ${tokenStatus}`,
+      `— ${mode} — ${tokenStatus} — ${approvalStatus}`,
     );
 
     const cleanup = () => {
@@ -789,15 +990,16 @@ async function main() {
  * Start the WebUI iff CLI --webui or [webui].enabled = true. Default off.
  * Returns the handle for shutdown, or undefined when WebUI is disabled.
  *
- * The audit/execution tail and approval-enqueue event streams are still
- * stubs — the WebUI ships in opt-in observer mode now and gains live events
- * once the boot wires an event-emitting ManualApproval engine.
+ * The audit/execution tail and approval-enqueue events are wired in via the
+ * engine and audit store adapters: WebUI sees pending approvals + execution
+ * tails in real time over SSE.
  */
-async function maybeStartWebUI(): Promise<{ close(): Promise<void> } | undefined> {
-  const tomlWebui = resolvedConfig.webui;
-  const active = WEBUI_FLAG || tomlWebui?.enabled === true;
-  if (!active) return undefined;
+async function maybeStartWebUI(
+  approvalEngine: ApprovalDispatcher | null,
+): Promise<{ close(): Promise<void> } | undefined> {
+  if (!isWebUIActive()) return undefined;
 
+  const tomlWebui = resolvedConfig.webui;
   const host = tomlWebui?.host ?? '127.0.0.1';
   const port = tomlWebui?.port ?? 8088;
   const authToken = tomlWebui?.auth_token;
@@ -808,8 +1010,9 @@ async function maybeStartWebUI(): Promise<{ close(): Promise<void> } | undefined
       port,
       authToken,
       registry: { list: () => registry.list() },
-      queue: buildWebUIApprovalQueueAdapter(),
-      // audit tail wiring lands in a follow-up — see deferred items in handoff.
+      queue: buildWebUIApprovalQueueAdapter(approvalEngine),
+      audit: buildWebUIAuditTailAdapter(auditStore),
+      getApprovalMode: makeApprovalModeLookup(),
     });
     const tokenStatus = authToken ? 'token required' : 'anonymous loopback';
     console.error(

@@ -10,6 +10,7 @@
  * timed out"`.
  */
 
+import { EventEmitter } from 'node:events';
 import {
   ApprovalContext,
   ApprovalDecision,
@@ -55,11 +56,12 @@ export class ManualApprovalDisabledError extends Error {
   }
 }
 
-export class ManualApproval implements ApprovalEngine {
+export class ManualApproval extends EventEmitter implements ApprovalEngine {
   private readonly timeoutMs: number;
   private readonly pending = new Map<string, QueueEntry>();
 
   constructor(opts: ManualApprovalOptions) {
+    super();
     if (!opts.webuiEnabled) {
       throw new ManualApprovalDisabledError();
     }
@@ -76,6 +78,11 @@ export class ManualApproval implements ApprovalEngine {
         if (!entry) return;
         clearTimeout(entry.timer);
         this.pending.delete(id);
+        // Emit resolve event before settling the promise so SSE clients see
+        // the resolution before the caller's next tick observes the result.
+        try {
+          this.emit('resolve', { id, enqueued_at, context: ctx }, decision);
+        } catch { /* listener errors must not affect the gate */ }
         resolve(decision);
       };
 
@@ -111,6 +118,9 @@ export class ManualApproval implements ApprovalEngine {
         },
       };
       this.pending.set(id, entry);
+      try {
+        this.emit('enqueue', { id, enqueued_at, context: ctx });
+      } catch { /* listener errors must not affect the gate */ }
     });
   }
 
