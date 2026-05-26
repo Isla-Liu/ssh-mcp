@@ -17,6 +17,7 @@ import {
   sanitizePassword,
   escapeCommandForShell,
 } from './utils/shell.js';
+import { gateApproval } from './approval/gate.js';
 
 // Re-exports for backward compatibility with existing tests.
 export { SSHConnectionManager, escapeCommandForShell };
@@ -338,6 +339,12 @@ server.tool(
     const sanitizedCommand = sanitizeCommand(command);
     try {
       const t = await registry.get(connectionName);
+      await gateApproval({
+        profile: { id: connectionName ?? 'default' },
+        tool: 'exec',
+        command: sanitizedCommand,
+        description,
+      });
       const commandWithDescription = description
         ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
         : sanitizedCommand;
@@ -363,6 +370,12 @@ if (!DISABLE_SUDO) {
       const sanitizedCommand = sanitizeCommand(command);
       try {
         const t = await registry.get(connectionName);
+        await gateApproval({
+          profile: { id: connectionName ?? 'default' },
+          tool: 'sudo-exec',
+          command: sanitizedCommand,
+          description,
+        });
         const commandWithDescription = description
           ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
           : sanitizedCommand;
