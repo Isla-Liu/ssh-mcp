@@ -277,6 +277,59 @@ function validateServerSection(raw: any) {
     }
     out.audit_max_bytes = raw.audit_max_bytes;
   }
+  if (raw.http !== undefined) {
+    if (typeof raw.http !== 'object' || raw.http === null) {
+      throw new Error('Config: [server.http] must be a table');
+    }
+    out.http = validateHttpSection(raw.http);
+  }
+  return out;
+}
+
+function validateHttpSection(raw: any) {
+  const out: NonNullable<TomlConfig['server']>['http'] = {};
+  if (raw.enabled !== undefined) {
+    if (typeof raw.enabled !== 'boolean') {
+      throw new Error('Config: [server.http].enabled must be a boolean');
+    }
+    out.enabled = raw.enabled;
+  }
+  if (raw.bind !== undefined) {
+    if (typeof raw.bind !== 'string' || !raw.bind) {
+      throw new Error('Config: [server.http].bind must be a non-empty string');
+    }
+    out.bind = raw.bind;
+  }
+  if (raw.port !== undefined) {
+    if (typeof raw.port !== 'number' || !Number.isInteger(raw.port) || raw.port < 1 || raw.port > 65535) {
+      throw new Error('Config: [server.http].port must be an integer 1-65535');
+    }
+    out.port = raw.port;
+  }
+  if (raw.auth_token_env !== undefined) {
+    if (typeof raw.auth_token_env !== 'string' || !raw.auth_token_env) {
+      throw new Error('Config: [server.http].auth_token_env must be a non-empty string (env var NAME, not the value)');
+    }
+    out.auth_token_env = raw.auth_token_env;
+  }
+  if (raw.origin_allowlist !== undefined) {
+    if (!Array.isArray(raw.origin_allowlist) || !raw.origin_allowlist.every((s: any) => typeof s === 'string')) {
+      throw new Error('Config: [server.http].origin_allowlist must be an array of strings');
+    }
+    out.origin_allowlist = raw.origin_allowlist as string[];
+  }
+  if (raw.allowed_hosts !== undefined) {
+    if (!Array.isArray(raw.allowed_hosts) || !raw.allowed_hosts.every((s: any) => typeof s === 'string')) {
+      throw new Error('Config: [server.http].allowed_hosts must be an array of strings');
+    }
+    out.allowed_hosts = raw.allowed_hosts as string[];
+  }
+  if (raw.request_timeout_ms !== undefined) {
+    if (typeof raw.request_timeout_ms !== 'number' || raw.request_timeout_ms <= 0) {
+      throw new Error('Config: [server.http].request_timeout_ms must be a positive number');
+    }
+    out.request_timeout_ms = raw.request_timeout_ms;
+  }
   return out;
 }
 

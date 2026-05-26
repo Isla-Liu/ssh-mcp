@@ -6,6 +6,8 @@ import { Client, ClientChannel } from 'ssh2';
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
+import { startHttpListener, validateHttpBootInvariants } from './http-listener.js';
+
 import { ISshTransport, TransportConfig, ServerConfig, ExecResult, AuthMode } from './transports/types.js';
 import { SSHConnectionManager, SSHConfig } from './transports/ssh2.js';
 import { createTransport } from './transports/factory.js';
@@ -137,6 +139,12 @@ const GSSAPI_DELEGATE = argvConfig.gssapiDelegateCredentials;
 const KNOWN_HOSTS_FILE = argvConfig.knownHostsFile;
 const STRICT_HOST_KEY = argvConfig.strictHostKeyChecking;
 const CONFIG_PATH = argvConfig.config;
+
+// HTTP transport CLI overrides (P2 §3). CLI > TOML > defaults.
+const TRANSPORT_MCP_FLAG = argvConfig['transport-mcp']; // 'stdio' | 'http' | undefined
+const HTTP_BIND_FLAG = argvConfig['http-bind'];
+const HTTP_PORT_FLAG = argvConfig['http-port'];
+const HTTP_TOKEN_ENV_FLAG = argvConfig['http-token-env'];
 
 const legacyFlagNames = [
   'host', 'user', 'password', 'key', 'kerberos', 'transport',
@@ -576,6 +584,30 @@ export async function execSshCommand(
 
 async function main() {
   await bootstrapRegistry();
+
+  const httpResolved = resolveHttpTransportConfig();
+
+  if (httpResolved) {
+    const handle = await startHttpListener(server, httpResolved.cfg);
+    const mode = isMultiHost ? `multi-host (${registry.names().length} servers)` : 'single-host';
+    const tokenStatus = httpResolved.tokenPresent ? 'bearer required' : 'anonymous loopback (WARN)';
+    console.error(
+      `SSH MCP Server running on HTTP http://${httpResolved.cfg.bind}:${handle.port}/mcp ` +
+      `— ${mode} — ${tokenStatus}`,
+    );
+
+    const cleanup = () => {
+      console.error('Shutting down SSH MCP Server (http)...');
+      void handle.close().catch(() => { /* ignore */ });
+      void registry.closeAll();
+      process.exit(0);
+    };
+    process.on('SIGINT', cleanup);
+    process.on('SIGTERM', cleanup);
+    process.on('exit', () => { void registry.closeAll(); });
+    return;
+  }
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   const mode = isMultiHost ? `multi-host (${registry.names().length} servers: ${registry.names().join(', ')})` : 'single-host';
@@ -590,6 +622,53 @@ async function main() {
   process.on('SIGINT', cleanup);
   process.on('SIGTERM', cleanup);
   process.on('exit', () => { void registry.closeAll(); });
+}
+
+/**
+ * Resolve effective HTTP transport config from CLI + TOML, or return undefined
+ * to keep the default stdio path.
+ *
+ * Resolution order (P2 §2/§3): CLI > TOML [server.http] > defaults.
+ * Active iff (CLI --transport-mcp=http) OR ([server.http].enabled=true).
+ */
+function resolveHttpTransportConfig(): {
+  cfg: Parameters<typeof startHttpListener>[1];
+  tokenPresent: boolean;
+} | undefined {
+  const tomlHttp = resolvedConfig.server?.http;
+  const transportFromCli = TRANSPORT_MCP_FLAG;
+  if (transportFromCli !== undefined && transportFromCli !== 'stdio' && transportFromCli !== 'http') {
+    throw new Error(`Invalid --transport-mcp=${transportFromCli} (expected: stdio or http)`);
+  }
+  const active = transportFromCli === 'http' || (transportFromCli !== 'stdio' && tomlHttp?.enabled === true);
+  if (!active) return undefined;
+
+  const bind = HTTP_BIND_FLAG ?? tomlHttp?.bind ?? '127.0.0.1';
+  const port = HTTP_PORT_FLAG !== undefined && HTTP_PORT_FLAG !== null
+    ? parseInt(HTTP_PORT_FLAG)
+    : (tomlHttp?.port ?? 8934);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error(`Invalid HTTP port: ${HTTP_PORT_FLAG ?? tomlHttp?.port}`);
+  }
+  const authTokenEnv = HTTP_TOKEN_ENV_FLAG ?? tomlHttp?.auth_token_env ?? 'SSH_MCP_HTTP_TOKEN';
+  const originAllowlist = tomlHttp?.origin_allowlist ?? ['http://127.0.0.1', 'http://localhost'];
+  const allowedHosts = tomlHttp?.allowed_hosts;
+  const requestTimeoutMs = tomlHttp?.request_timeout_ms ?? 60000;
+
+  // Fail-closed boot invariant: non-loopback + missing token = fatal.
+  const { token } = validateHttpBootInvariants({ bind, authTokenEnv });
+
+  return {
+    cfg: {
+      bind,
+      port,
+      authTokenEnv,
+      originAllowlist,
+      allowedHosts,
+      requestTimeoutMs,
+    },
+    tokenPresent: typeof token === 'string' && token.length > 0,
+  };
 }
 
 if (isTestMode) {

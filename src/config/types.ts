@@ -18,6 +18,8 @@ export interface ServerSection {
   audit_dir?: string;
   /** Per-record stdout/stderr cap. Default 10000. */
   audit_max_bytes?: number;
+  /** [server.http] — opt-in HTTP MCP transport. */
+  http?: HttpServerSection;
 }
 
 /** Top-level [webui] block — optional. WebUI is OFF unless enabled or --webui passed. */
@@ -26,6 +28,24 @@ export interface WebUISection {
   host?: string;        // default 127.0.0.1
   port?: number;        // default 8088
   auth_token?: string;  // required when host != 127.0.0.1; supports env:NAME
+}
+
+/**
+ * Top-level [server.http] block — opt-in Streamable HTTP MCP transport.
+ * Off by default; legacy stdio remains the default transport.
+ * Per P2 plan §2 and task body (rev 2). Production default port 8934 (Hyper-V
+ * `_Mcp Servers Allow Wsl only` rule covers 8931-8939).
+ */
+export interface HttpServerSection {
+  enabled?: boolean;              // default false
+  bind?: string;                  // default "127.0.0.1"
+  port?: number;                  // default 8934
+  /** Name of env var that holds the bearer token (never the value itself). */
+  auth_token_env?: string;        // default "SSH_MCP_HTTP_TOKEN"
+  origin_allowlist?: string[];    // default ["http://127.0.0.1", "http://localhost"]
+  /** Allowed Host headers. Default derived from bind+port at boot. */
+  allowed_hosts?: string[];
+  request_timeout_ms?: number;    // default 60000
 }
 
 /** [approval.llm] block — used in smart mode. */

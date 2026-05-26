@@ -150,15 +150,29 @@ export class OpenSshTransport implements ISshTransport {
     }
 
     switch (cfg.authMode) {
-      case 'kerberos':
+      case 'kerberos': {
         a.push(
           '-o', 'GSSAPIAuthentication=yes',
           '-o', `GSSAPIDelegateCredentials=${cfg.gssapiDelegateCredentials ?? 'no'}`,
-          '-o', 'PreferredAuthentications=gssapi-with-mic',
-          '-o', 'PubkeyAuthentication=no',
-          '-o', 'PasswordAuthentication=no',
         );
+        // Relax PreferredAuthentications ONLY when a fallback credential
+        // is configured. Pure-kerberos configs stay strict so failures are
+        // loud and recognizable (auth category in classifyError).
+        const hasFallback = !!(cfg.keyPath || cfg.privateKey || cfg.password);
+        if (hasFallback) {
+          a.push(
+            '-o', 'PreferredAuthentications=gssapi-with-mic,publickey,password',
+          );
+          if (cfg.keyPath) a.push('-i', cfg.keyPath);
+        } else {
+          a.push(
+            '-o', 'PreferredAuthentications=gssapi-with-mic',
+            '-o', 'PubkeyAuthentication=no',
+            '-o', 'PasswordAuthentication=no',
+          );
+        }
         break;
+      }
       case 'key':
         if (cfg.keyPath) a.push('-i', cfg.keyPath);
         a.push(
