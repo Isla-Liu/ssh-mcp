@@ -458,16 +458,26 @@ export function resultToMcpContent(result: ExecResult) {
   };
 }
 
-const server = new McpServer({
-  name: 'SSH MCP Server',
-  version: '2.1.0',
-  capabilities: { resources: {}, tools: {} },
-});
-
 const connectionNameSchema = z.string().optional()
   .describe('Name of the SSH connection (from --ssh config). Optional when only one server is configured.');
 
-server.tool(
+/**
+ * Build a fresh McpServer with every SSH tool registered. Called once per
+ * stdio boot, and once per HTTP MCP session (per-session because the SDK
+ * Protocol class stores `_transport` on the server instance — reusing one
+ * server across multiple transports breaks earlier sessions).
+ *
+ * All tools close over module-level state (registry, auditStore, etc.) so
+ * sessions still share the warm SSH connection pool and audit history.
+ */
+export function buildMcpServer(): McpServer {
+  const server = new McpServer({
+    name: 'SSH MCP Server',
+    version: '2.1.0',
+    capabilities: { resources: {}, tools: {} },
+  });
+
+  server.tool(
   'exec',
   'Execute a shell command on a remote SSH server and return the output.',
   {
@@ -584,7 +594,7 @@ if (!DISABLE_SUDO) {
   );
 }
 
-server.tool(
+  server.tool(
   'list-servers',
   'List all configured SSH server connections, their auth mode, and current connection status.',
   {},
@@ -601,6 +611,9 @@ server.tool(
     return { content: [{ type: 'text', text }] };
   }
 );
+
+  return server;
+}
 
 // =============================================================================
 // Legacy exports preserved for existing test files.
@@ -945,7 +958,7 @@ async function main() {
   const httpResolved = resolveHttpTransportConfig();
 
   if (httpResolved) {
-    const handle = await startHttpListener(server, httpResolved.cfg);
+    const handle = await startHttpListener(buildMcpServer, httpResolved.cfg);
     const mode = isMultiHost ? `multi-host (${registry.names().length} servers)` : 'single-host';
     const tokenStatus = httpResolved.tokenPresent ? 'bearer required' : 'anonymous loopback (WARN)';
     const approvalStatus = approvalEngine
@@ -970,7 +983,8 @@ async function main() {
   }
 
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  const stdioServer = buildMcpServer();
+  await stdioServer.connect(transport);
   const mode = isMultiHost ? `multi-host (${registry.names().length} servers: ${registry.names().join(', ')})` : 'single-host';
   console.error(`SSH MCP Server running on stdio — ${mode}`);
 
@@ -1078,7 +1092,8 @@ if (isTestMode) {
       await bootstrapRegistry();
     } catch { /* tests may not configure hosts */ }
     const transport = new StdioServerTransport();
-    server.connect(transport).catch(error => {
+    const testServer = buildMcpServer();
+    testServer.connect(transport).catch((error: unknown) => {
       console.error('Fatal error connecting server:', error);
       process.exit(1);
     });
