@@ -1643,7 +1643,13 @@ const server = new McpServer({
 });
 
 const connectionNameSchema = z.string().optional()
-  .describe('Name of the SSH connection (from --ssh config). Optional when only one server is configured.');
+  .describe(
+    'Name of the SSH connection to target (the id/name from your --ssh=<JSON> config). ' +
+    'REQUIRED when multiple SSH connections are configured: omitting or blanking it fails fast with the list ' +
+    'of valid names instead of silently routing to the default source. Omission is allowed only for a true ' +
+    'single-source deployment (the lone source is used), or when the operator has explicitly opted out of ' +
+    'the multi-connection requirement to restore the legacy silent-default fallback.',
+  );
 
 server.tool(
   'exec',
