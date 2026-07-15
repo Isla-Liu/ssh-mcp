@@ -15,6 +15,8 @@ import {
   sanitizePassword,
   escapeCommandForShell,
 } from './utils/shell.js';
+import { AuditStore, resolveAuditDir, yoloApproval } from './audit/store.js';
+import { AuditTool } from './audit/types.js';
 
 // Re-exports for backward compatibility with existing tests.
 export { SSHConnectionManager, escapeCommandForShell };
@@ -247,6 +249,27 @@ const SUDOPASSWORD = argvConfig.sudoPassword;
 const DISABLE_SUDO = argvConfig.disableSudo !== undefined;
 const KEY = argvConfig.key;
 const DEFAULT_TIMEOUT = argvConfig.timeout ? parseInt(argvConfig.timeout) : 60000;
+// TODO(toml-config): read [server].audit_dir / [server].audit_max_bytes from
+// the resolved TOML config once the toml-config card lands. For now, keep the
+// documented default and support env overrides for tests/operators.
+const AUDIT_DIR = resolveAuditDir(process.env.SSH_MCP_AUDIT_DIR);
+const AUDIT_MAX_BYTES = (() => {
+  const raw = process.env.SSH_MCP_AUDIT_MAX_BYTES;
+  if (!raw) return 10_000;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10_000;
+})();
+// Audit store is constructed lazily (see getAuditStore) so that merely
+// importing this module — e.g. under SSH_MCP_DISABLE_MAIN=1 for library use
+// or unit tests — never performs audit-directory filesystem I/O. The store
+// is materialized on first actual audit write (CLI/tool execution).
+let _auditStore: AuditStore | null = null;
+function getAuditStore(): AuditStore {
+  if (_auditStore === null) {
+    _auditStore = new AuditStore({ auditDir: AUDIT_DIR, auditMaxBytes: AUDIT_MAX_BYTES });
+  }
+  return _auditStore;
+}
 const MAX_CHARS_RAW = argvConfig.maxChars;
 const MAX_CHARS = (() => {
   if (typeof MAX_CHARS_RAW === 'string') {
@@ -528,6 +551,120 @@ async function bootstrapRegistry(): Promise<void> {
   }
 }
 
+function resolvedProfileName(connectionName?: string): string {
+  // Delegate to the registry's non-throwing resolver so an ambiguous
+  // multi-host call (name omitted, >1 server, no explicit default) is recorded
+  // as '(unresolved)' instead of being misattributed to the first server on the
+  // failure-audit path.
+  return registry.resolveProfileName(connectionName);
+}
+
+function auditExecution(params: {
+  tool: AuditTool;
+  profile: string;
+  command: string;
+  description?: string;
+  startedAt: number;
+  result?: ExecResult;
+  error?: unknown;
+  store?: AuditStore;
+}): void {
+  const now = new Date();
+  const durationMs = Math.max(0, Date.now() - params.startedAt);
+  try {
+    // Resolve the store inside the try: lazily constructing it can throw when
+    // the audit directory is unwritable, and audit logging is best-effort —
+    // a store-construction failure must not surface to the caller either.
+    const store = params.store ?? getAuditStore();
+    store.append({
+      profile: params.profile,
+      tool: params.tool,
+      command: params.command,
+      description: params.description,
+      approval: yoloApproval(now),
+      exec: params.result
+        ? {
+            stdout: params.result.stdout ?? '',
+            stderr: params.result.stderr ?? '',
+            exitCode: params.result.exitCode ?? null,
+            durationMs,
+          }
+        : {
+            stdout: '',
+            stderr: params.error instanceof Error ? params.error.message : String(params.error ?? 'unknown error'),
+            exitCode: null,
+            durationMs,
+          },
+      now,
+    });
+  } catch (auditErr: any) {
+    // Audit failure must be visible but should not hide the real SSH result.
+    console.error(`audit log append failed: ${auditErr?.message || auditErr}`);
+  }
+}
+
+export async function executeAuditedTransportCommand(input: {
+  transport: Pick<ISshTransport, 'exec' | 'execElevated'>;
+  tool: AuditTool;
+  command: string;
+  description?: string;
+  profile?: string;
+  timeoutMs?: number;
+  sudoPassword?: string;
+  store: AuditStore;
+}) {
+  const startedAt = Date.now();
+  const profile = input.profile ?? 'default';
+  let audited = false;
+  // Record the raw attempted command if sanitization rejects it below. A
+  // command rejected by validation (empty / over --maxChars) still leaves an
+  // audit record — the contract covers failures, and sanitizeCommand throws.
+  let auditCommand = String(input.command ?? '');
+  try {
+    const sanitizedCommand = sanitizeCommand(input.command);
+    const commandWithDescription = input.description
+      ? `${sanitizedCommand} # ${input.description.replace(/#/g, '\\#')}`
+      : sanitizedCommand;
+    auditCommand = commandWithDescription;
+    const result = input.tool === 'sudo-exec'
+      ? await input.transport.execElevated(commandWithDescription, {
+          timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT,
+          mode: 'sudo',
+          password: input.sudoPassword,
+        })
+      : await input.transport.exec(commandWithDescription, { timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT });
+    auditExecution({
+      tool: input.tool,
+      profile,
+      command: commandWithDescription,
+      description: input.description,
+      startedAt,
+      result,
+      store: input.store,
+    });
+    audited = true;
+    return resultToMcpContent(result);
+  } catch (err) {
+    // Transport rejection (spawn failure, unexpected exception) OR a
+    // sanitization rejection (empty/too-long command) still gets an audit
+    // record — the contract is "audit success AND failure", matching the
+    // exec/sudo-exec MCP handlers. `audited` guards the resultToMcpContent
+    // throw path (result already audited above) from double-writing.
+    if (!audited) {
+      auditExecution({
+        tool: input.tool,
+        profile,
+        command: auditCommand,
+        description: input.description,
+        startedAt,
+        error: err,
+        store: input.store,
+      });
+    }
+    throw err;
+  }
+}
+
 /**
  * Map ExecResult to MCP tool response. Preserves upstream semantics:
  *   - auth/host_key/connect/transport categories → reject with descriptive error
@@ -620,15 +757,33 @@ server.tool(
     connectionName: connectionNameSchema,
   },
   async ({ command, description, connectionName }) => {
-    const sanitizedCommand = sanitizeCommand(command);
+    const profile = resolvedProfileName(connectionName);
+    const startedAt = Date.now();
+    let audited = false;
+    // Record the raw attempted command if sanitization rejects it below. A
+    // command rejected by validation (empty / over --maxChars) still leaves an
+    // audit record — the contract covers failures, and sanitizeCommand throws.
+    let auditCommand = String(command ?? '');
     try {
+      const sanitizedCommand = sanitizeCommand(command);
       const t = await registry.get(connectionName);
       const commandWithDescription = description
         ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
         : sanitizedCommand;
+      auditCommand = commandWithDescription;
       const result = await t.exec(commandWithDescription, { timeoutMs: DEFAULT_TIMEOUT });
+      auditExecution({
+        tool: 'exec',
+        profile,
+        command: commandWithDescription,
+        description,
+        startedAt,
+        result,
+      });
+      audited = true;
       return resultToMcpContent(result);
     } catch (err: any) {
+      if (!audited) auditExecution({ tool: 'exec', profile, command: auditCommand, description, startedAt, error: err });
       if (err instanceof McpError) throw err;
       throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
     }
@@ -645,12 +800,21 @@ if (!DISABLE_SUDO) {
       connectionName: connectionNameSchema,
     },
     async ({ command, description, connectionName }) => {
-      const sanitizedCommand = sanitizeCommand(command);
+      const profile = resolvedProfileName(connectionName);
+      const startedAt = Date.now();
+      let audited = false;
+      // Record the raw attempted command if sanitization rejects it below. A
+      // command rejected by validation (empty / over --maxChars) still leaves
+      // an audit record — the contract covers failures, and sanitizeCommand
+      // throws.
+      let auditCommand = String(command ?? '');
       try {
+        const sanitizedCommand = sanitizeCommand(command);
         const t = await registry.get(connectionName);
         const commandWithDescription = description
           ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
           : sanitizedCommand;
+        auditCommand = commandWithDescription;
         // Legacy single-host mode may still pass --sudoPassword on CLI; in
         // multi-host mode each ServerConfig carries its own sudoPassword.
         const legacySudo = (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined && !isMultiHost)
@@ -661,8 +825,18 @@ if (!DISABLE_SUDO) {
           mode: 'sudo',
           password: legacySudo,
         });
+        auditExecution({
+          tool: 'sudo-exec',
+          profile,
+          command: commandWithDescription,
+          description,
+          startedAt,
+          result,
+        });
+        audited = true;
         return resultToMcpContent(result);
       } catch (err: any) {
+        if (!audited) auditExecution({ tool: 'sudo-exec', profile, command: auditCommand, description, startedAt, error: err });
         if (err instanceof McpError) throw err;
         throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
       }
