@@ -1,0 +1,74 @@
+# ssh-mcp first-class TOML config example.
+#
+# Equivalent CLI multi-host shape:
+#   --ssh='{"name":"prod-bastion","host":"bastion.example.com","port":22,"user":"aduser@EXAMPLE.INTERNAL","auth":"kerberos"}'
+#   --ssh='{"name":"lab","host":"lab.internal","user":"root","auth":"key","keyPath":"~/.ssh/lab_ed25519","sudoPassword":"..."}'
+#
+# Note: per-source `description` is reserved — it is validated on load but not
+# yet surfaced anywhere; a later web-UI task consumes it. Safe to set now.
+
+[server]
+audit_dir = "~/.ssh-mcp"
+audit_max_bytes = 10000
+# Multi-source connection guard. Default: true (safe).
+#
+# When more than one [[sources]] is configured and no source is marked
+# `default = true`, a tool call that omits or blanks `connectionName` FAILS FAST
+# with the list of valid names, instead of silently routing to whichever source
+# happened to register first. Marking a source `default = true` is an explicit
+# routing choice and still allows omitted names; the example below does this for
+# `prod-bastion`. Single-source deployments are unaffected — omission always
+# resolves the lone source regardless of this flag.
+#
+# require_connection = true   # default; leave it on.
+#
+# !!! DANGER — EMERGENCY OPT-OUT ONLY !!!
+# Setting this to false RE-ENABLES the dangerous legacy silent-default fallback:
+# a multi-source call with no connectionName will quietly run against the default
+# source. Use ONLY as a temporary rollback for a compatibility break, and remove
+# it as soon as callers are fixed. Do NOT ship false to production long-term.
+# require_connection = false
+
+[webui]
+enabled = false
+host = "127.0.0.1"
+port = 8088
+# Set true only when a token-authenticated browser client is hosted on another origin.
+# cors = false
+# auth_token = "env:SSHMCP_WEBUI_TOKEN"  # required when host is non-loopback
+
+[approval]
+# The approval-engine lane can run standalone before the WebUI approval
+# resolver lands. Keep the copy-paste example bootable with WebUI disabled;
+# switch to mode = "manual" only when [webui].enabled = true (or --webui) and
+# a resolver is wired.
+mode = "yolo"
+fail_closed = true
+
+[approval.llm]
+endpoint = "https://api.openai.com/v1/chat/completions"
+api_key = "env:OPENAI_API_KEY"
+model = "gpt-4o-mini"
+timeout_ms = 8000
+
+[[sources]]
+id = "prod-bastion"
+description = "Production jump host. Allowed: read-only diagnostics."
+host = "bastion.example.com"
+port = 22
+user = "aduser@EXAMPLE.INTERNAL"
+auth = "kerberos"
+default = true
+
+[[sources]]
+id = "lab"
+description = "Lab box for experiments."
+host = "lab.internal"
+user = "root"
+auth = "key"
+key_path = "~/.ssh/lab_ed25519"
+sudo_password = "env:LAB_SUDO_PASS"
+
+# Optional per-source approval override for the immediately preceding source.
+[sources.approval]
+mode = "yolo"
