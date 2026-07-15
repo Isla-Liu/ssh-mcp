@@ -11,13 +11,14 @@
  *      `--api-key=VALUE`, `--secret VALUE`, `Authorization: Bearer ...`.
  *   2. Inline `KEY=value` env-style pairs (KEY matches PASSWORD/TOKEN/SECRET/...).
  *   3. JSON / TOML quoted `"key": "value"` pairs for the same key set.
- *   4. PEM blocks (BEGIN/END *PRIVATE KEY*).
+ *   4. PEM blocks (BEGIN/END *PRIVATE KEY*) and dangling BEGIN blocks.
  *   5. AWS access-key-id shapes (AKIA/ASIA + 16 chars).
  *   6. AWS secret-access-key when on the same line as a hint.
  *   7. JWT tokens (three base64url segments).
  *   8. GitHub PATs (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`).
  *   9. Slack tokens (`xox[abprs]-...`).
  *  10. Google API keys (`AIza...`, 39 chars).
+ *  11. OpenAI API keys (`sk-...`, including `sk-proj-...`).
  */
 
 const REDACTED = '<redacted>';
@@ -91,8 +92,10 @@ const SHELL_ASSIGN_RE = new RegExp(
 );
 
 // 3. JSON / TOML "key": "value" (case-insensitive).
-const JSON_KV_OPEN_QUOTED_RE =
-  /("[^"\\]*(?:password|passwd|passphrase|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|auth[-_]?token)[^"\\]*"\s*[:=]\s*)"(?:[^"\\]|\\.)*$/gi;
+const JSON_KV_OPEN_QUOTED_RE = new RegExp(
+  String.raw`("[^"\\]*(?:password|passwd|passphrase|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|auth[-_]?token)[^"\\]*"\s*[:=]\s*)${OPEN_DQ_VALUE}`,
+  'gi',
+);
 const JSON_KV_RE =
   /("[^"\\]*(?:password|passwd|passphrase|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|auth[-_]?token)[^"\\]*"\s*[:=]\s*)"(?:[^"\\]|\\.)*"/gi;
 
@@ -133,8 +136,9 @@ const AWS_ACCESS_KEY_RE = /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g;
 const AWS_SECRET_HINT_RE =
   /(aws[_-]?secret[_-]?access[_-]?key\s*[:=]?\s*["']?)([A-Za-z0-9/+]{40})(["']?)/gi;
 
-// 7. JWT (three base64url segments).
-const JWT_RE = /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
+// 7. JWT (three base64url segments). Claims need not start with `eyJ`: a
+// valid compact JWT whose payload is `{}` uses the short segment `e30`.
+const JWT_RE = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{8,}\b/g;
 
 // 8. GitHub PATs — classic (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`) and
 //    fine-grained (`github_pat_...`, which embeds underscores in its body).
@@ -147,20 +151,77 @@ const SLACK_TOKEN_RE = /\bxox[abprs]-[A-Za-z0-9\-]{10,}\b/g;
 // 10. Google API keys
 const GOOGLE_API_KEY_RE = /\bAIza[0-9A-Za-z_\-]{35}\b/g;
 
-// 11. URL userinfo credentials, e.g. https://alice:hunter2@example.com/repo.git
-//     or postgres://user:pass@db:5432/app. Redact ONLY the password component,
+// 11. OpenAI API keys. Preserve the leading delimiter instead of relying on
+// word boundaries: OpenAI keys permit `_`/`-`, both of which make `\b`
+// unreliable at token edges. The minimum avoids redacting short prose such as
+// `sk-test`; current legacy and project-scoped keys are comfortably longer.
+const OPENAI_API_KEY_RE =
+  /(^|[^A-Za-z0-9_-])sk-(?:proj-)?[A-Za-z0-9_-]{20,255}(?=$|[^A-Za-z0-9_-])/g;
+
+// 12. URL userinfo credentials, e.g. https://alice:hunter2@example.com/repo.git
+//     or postgres://user:***@db:5432/app. Redact ONLY the password component,
 //     preserving scheme, username, and host so the audited URL stays
-//     recognizable. The password is any run of non-`@`, non-`/`, non-`:`,
-//     non-whitespace chars between the `:` after the username and the `@`.
-const URL_USERINFO_RE =
-  /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s:/@]+:)([^\s/@]+)(@)/g;
+//     recognizable. Implemented as a linear scanner instead of a greedy regex:
+//     pre-redaction may run over multi-MB strings, and a regex like
+//     `[A-Za-z][A-Za-z0-9+.-]*://` can become O(n^2) on long alphabetic text
+//     with no URL delimiter.
+function isSchemeChar(ch: string): boolean {
+  return /[A-Za-z0-9+.-]/.test(ch);
+}
+
+function isValidScheme(scheme: string): boolean {
+  return /^[A-Za-z][A-Za-z0-9+.-]*$/.test(scheme);
+}
+
+function isAuthorityBoundary(ch: string): boolean {
+  return ch === '/' || ch === '?' || ch === '#' || /\s/.test(ch);
+}
 
 function redactUrlUserinfo(input: string): string {
-  // Avoid running the scheme regex over arbitrarily large non-URL output. A
-  // quick literal search is linear and lets the full-input pre-redaction path
-  // return immediately for the overwhelmingly common no-URL case.
-  if (!input.includes('://')) return input;
-  return input.replace(URL_USERINFO_RE, (_m, head, _pw, at) => `${head}${REDACTED}${at}`);
+  let cursor = 0;
+  let searchFrom = 0;
+  let out = '';
+
+  while (true) {
+    const sep = input.indexOf('://', searchFrom);
+    if (sep === -1) break;
+
+    let schemeStart = sep - 1;
+    while (schemeStart >= 0 && isSchemeChar(input[schemeStart])) schemeStart--;
+    schemeStart += 1;
+    const scheme = input.slice(schemeStart, sep);
+    if (!isValidScheme(scheme)) {
+      searchFrom = sep + 3;
+      continue;
+    }
+
+    const authorityStart = sep + 3;
+    let at = -1;
+    for (let i = authorityStart; i < input.length; i++) {
+      const ch = input[i];
+      if (ch === '@') {
+        at = i;
+        break;
+      }
+      if (isAuthorityBoundary(ch)) break;
+    }
+    if (at === -1) {
+      searchFrom = authorityStart;
+      continue;
+    }
+
+    const colon = input.indexOf(':', authorityStart);
+    if (colon === -1 || colon > at) {
+      searchFrom = at + 1;
+      continue;
+    }
+
+    out += input.slice(cursor, colon + 1) + REDACTED + '@';
+    cursor = at + 1;
+    searchFrom = at + 1;
+  }
+
+  return cursor === 0 ? input : out + input.slice(cursor);
 }
 
 interface Rule {
@@ -181,8 +242,6 @@ const RULES: Rule[] = [
   { re: CLI_SHORT_P_QUOTED_ARG_RE, replace: (_m, lead, arg) => `${lead}${arg[0]}-p${REDACTED}${arg[0]}` },
   { re: CLI_SHORT_P_ATTACHED_RE, replace: (_m, lead, quote) => `${lead}${quote}-p${REDACTED}${quote}` },
   { re: AUTH_HEADER_RE, replace: (_m, hdr, scheme) => `${hdr}${scheme} ${REDACTED}` },
-  // URL userinfo password: keep scheme://user, drop the password, keep @host.
-  { re: URL_USERINFO_RE, replace: (_m, head, _pw, at) => `${head}${REDACTED}${at}` },
   { re: SHELL_ASSIGN_OPEN_QUOTED_RE, replace: (_m, key) => `${key}${REDACTED}` },
   { re: SHELL_ASSIGN_RE, replace: (_m, key) => `${key}${REDACTED}` },
   { re: JSON_KV_OPEN_QUOTED_RE, replace: (_m, head) => `${head}"${REDACTED}"` },
@@ -203,11 +262,12 @@ const RULES: Rule[] = [
   { re: GITHUB_TOKEN_RE, replace: REDACTED },
   { re: SLACK_TOKEN_RE, replace: REDACTED },
   { re: GOOGLE_API_KEY_RE, replace: REDACTED },
+  { re: OPENAI_API_KEY_RE, replace: (_m, lead) => `${lead}${REDACTED}` },
 ];
 
 export function redact(input: string | undefined | null): string {
   if (!input) return '';
-  let out = input;
+  let out = redactUrlUserinfo(input);
   for (const rule of RULES) {
     out = out.replace(rule.re as RegExp, rule.replace as any);
   }
@@ -249,13 +309,13 @@ export function redactPemBlocks(input: string | undefined | null): string {
  *     END terminator falls past the window.
  *   - JWTs, whose signature/claims (cert chains, large payloads) can push the
  *     third segment past the 4 KiB headroom (Codex 3541772953).
- *   - URL userinfo passwords, whose `@` delimiter can fall past the bounded
- *     scan window when the credential is long.
+ *   - URL userinfo credentials, whose `@` delimiter can fall beyond the bounded
+ *     scan window (Codex 3549282015).
  * All three are matched here over the whole input first, so their full extent is
  * replaced with `<redacted>` regardless of where the cap lands. The full scan
- * is cheap when neither shape is present (fast literal prefix scan); the cost
- * is paid only when key/token material actually exists — exactly when it must
- * be redacted.
+ * is cheap when none of the shapes are present (fast literal prefix scan); the
+ * cost is paid only when secret material actually exists — exactly when it
+ * must be redacted.
  */
 export function preRedactUnboundedTokens(input: string | undefined | null): string {
   if (!input) return '';

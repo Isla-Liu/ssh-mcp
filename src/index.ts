@@ -10,13 +10,41 @@ import { ISshTransport, TransportConfig, ServerConfig, ExecResult, AuthMode } fr
 import { SSHConnectionManager, SSHConfig } from './transports/ssh2.js';
 import { createTransport } from './transports/factory.js';
 import { TransportRegistry } from './transports/registry.js';
+import { resolveConfig } from './config/resolver.js';
+import { expandHome } from './config/toml-loader.js';
+import type { ResolvedConfig, ApprovalMode } from './config/types.js';
+import { resolveApprovalEngineInput as resolveApprovalEngineInputForConfig } from './config/approval-policy.js';
+import { startConfigWatcher } from './config/config-watcher.js';
+import { ConfigReloader } from './config/reloader.js';
 import {
   sanitizeCommand as sanitizeCommandImpl,
   sanitizePassword,
   escapeCommandForShell,
 } from './utils/shell.js';
-import { AuditStore, resolveAuditDir, yoloApproval } from './audit/store.js';
-import { AuditTool } from './audit/types.js';
+import {
+  gateApproval,
+  getApprovalDecisionFromError,
+  setApprovalEngine,
+  buildApprovalEngineFromConfig,
+  manualWithoutResolverWarning,
+  type ApprovalDecision,
+  type BuildEngineFromConfigInput,
+  type ApprovalDispatcher,
+  type ResolvedSource,
+} from './approval/index.js';
+import { loadAuditSink, stderrWithExecutionError, type AuditSink } from './approval/audit-seam.js';
+import { AUDIT_COMMAND_MIN_CAP_BYTES, capThenRedact } from './audit/store.js';
+import { startWebUI } from './webui/server.js';
+import type {
+  ManualApprovalQueue,
+  PendingApproval as WebUIPendingApproval,
+  ApprovalDecision as WebUIApprovalDecision,
+  AuditTail as WebUIAuditTail,
+  ModeController as WebUIModeController,
+  SourceController as WebUISourceController,
+  SourceUpdatedEvent as WebUISourceUpdatedEvent,
+  ConfigReloadController as WebUIConfigReloadController,
+} from './webui/types.js';
 
 // Re-exports for backward compatibility with existing tests.
 export { SSHConnectionManager, escapeCommandForShell };
@@ -118,6 +146,7 @@ export function parseServerConfigJson(raw: string): ServerConfig {
     username: user,
     authMode: auth,
   };
+  if (typeof obj.description === 'string') cfg.description = obj.description;
 
   switch (auth) {
     case 'kerberos':
@@ -249,27 +278,6 @@ const SUDOPASSWORD = argvConfig.sudoPassword;
 const DISABLE_SUDO = argvConfig.disableSudo !== undefined;
 const KEY = argvConfig.key;
 const DEFAULT_TIMEOUT = argvConfig.timeout ? parseInt(argvConfig.timeout) : 60000;
-// TODO(toml-config): read [server].audit_dir / [server].audit_max_bytes from
-// the resolved TOML config once the toml-config card lands. For now, keep the
-// documented default and support env overrides for tests/operators.
-const AUDIT_DIR = resolveAuditDir(process.env.SSH_MCP_AUDIT_DIR);
-const AUDIT_MAX_BYTES = (() => {
-  const raw = process.env.SSH_MCP_AUDIT_MAX_BYTES;
-  if (!raw) return 10_000;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10_000;
-})();
-// Audit store is constructed lazily (see getAuditStore) so that merely
-// importing this module — e.g. under SSH_MCP_DISABLE_MAIN=1 for library use
-// or unit tests — never performs audit-directory filesystem I/O. The store
-// is materialized on first actual audit write (CLI/tool execution).
-let _auditStore: AuditStore | null = null;
-function getAuditStore(): AuditStore {
-  if (_auditStore === null) {
-    _auditStore = new AuditStore({ auditDir: AUDIT_DIR, auditMaxBytes: AUDIT_MAX_BYTES });
-  }
-  return _auditStore;
-}
 const MAX_CHARS_RAW = argvConfig.maxChars;
 const MAX_CHARS = (() => {
   if (typeof MAX_CHARS_RAW === 'string') {
@@ -288,6 +296,37 @@ const KERBEROS_FLAG = argvConfig.kerberos !== undefined && argvConfig.kerberos !
 const GSSAPI_DELEGATE = argvConfig.gssapiDelegateCredentials;
 const KNOWN_HOSTS_FILE = argvConfig.knownHostsFile;
 const STRICT_HOST_KEY = argvConfig.strictHostKeyChecking;
+// The explicit `--config` path is resolved (and value-less `--config` rejected)
+// once below, then reused by both boot resolution and hot-reload eligibility.
+
+// Flags that signal intent to use the legacy single-host CLI mode. NOTE:
+// `disableSudo` is deliberately excluded — it only controls whether the sudo
+// tool is registered and is valid across ALL modes (multi-host --ssh and TOML
+// --config included). Treating it as a legacy trigger made
+// `--config cfg.toml --disableSudo` route through validateConfig(false) and
+// wrongly demand --host/--user. `port` stays here because it is only
+// meaningful as part of a single-host source.
+const legacyFlagNames = [
+  'host', 'user', 'password', 'key', 'kerberos', 'transport',
+  'strictHostKeyChecking', 'knownHostsFile', 'gssapiDelegateCredentials',
+  'suPassword', 'sudoPassword', 'port',
+] as const;
+
+export function hasLegacyCliFlags(config: Record<string, string | null>): boolean {
+  return legacyFlagNames.some(f => config[f] !== undefined);
+}
+
+/**
+ * Reject a present-but-value-less --ssh before TOML discovery can provide a
+ * lower-precedence source. parseArgv records bare `--ssh` (including the first
+ * half of a space-separated `--ssh JSON` invocation) as null, while valid
+ * repeatable `--ssh=<JSON>` arguments are collected separately.
+ */
+export function validateSshCliFlag(config: Record<string, string | null>): void {
+  if ('ssh' in config && config.ssh === null) {
+    throw new Error('Configuration error:\n--ssh requires a value (--ssh=<JSON>)');
+  }
+}
 
 function validateConfig(config: Record<string, string | null>, multiHost = false) {
   const errors: string[] = [];
@@ -364,9 +403,123 @@ function validateConfig(config: Record<string, string | null>, multiHost = false
 }
 
 const isMultiHost = sshJsonArgs.length > 0;
+const hasLegacyCli = hasLegacyCliFlags(argvConfig);
+
+// Validate CLI-mode errors before TOML discovery/loading. Otherwise an
+// incomplete legacy invocation such as `--host=h` can auto-discover an unrelated
+// TOML file and report that TOML's parse/env error before the real missing
+// `--user` legacy CLI error.
+if (isCliEnabled || isTestMode) {
+  validateSshCliFlag(argvConfig);
+  if (isMultiHost) {
+    validateConfig(argvConfig, true);
+  } else if (hasLegacyCli) {
+    validateConfig(argvConfig, false);
+  }
+}
+
+function buildLegacyServerConfig(): ServerConfig | undefined {
+  if (!HOST || !USER) return undefined;
+
+  // Precedence must match resolveAuthMode (kerberos > password > key), NOT a
+  // key-before-password order. When a legacy invocation supplies both
+  // --password and --key, password wins: classifying it as key auth would make
+  // prepareKeyContents read the (possibly stale/sample) key file → ENOENT, and
+  // could let the ssh2 transport prefer the key over the intended password
+  // (regression vs base `main`). See resolveAuthMode's doc-comment.
+  const authMode: AuthMode | undefined = resolveAuthMode({
+    kerberos: KERBEROS_FLAG,
+    password: PASSWORD,
+    key: KEY,
+  });
+  const resolvedTransport: 'ssh2' | 'openssh' =
+    (TRANSPORT_FLAG === 'openssh' || KERBEROS_FLAG) ? 'openssh' : 'ssh2';
+
+  const cfg: ServerConfig = {
+    name: 'default',
+    host: HOST,
+    port: PORT,
+    username: USER,
+    transport: resolvedTransport,
+    authMode,
+  };
+  if (PASSWORD) cfg.password = PASSWORD;
+  // Only attach the key path when key auth actually wins. Attaching a stale
+  // --key on a password/kerberos source would make prepareKeyContents (ssh2)
+  // read the possibly-nonexistent file, and openssh's password/kerberos
+  // branches never use keyPath anyway.
+  if (KEY && authMode === 'key') cfg.keyPath = KEY;
+  if (SUPASSWORD !== null && SUPASSWORD !== undefined) cfg.suPassword = sanitizePassword(SUPASSWORD);
+  if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) cfg.sudoPassword = sanitizePassword(SUDOPASSWORD);
+  if (KERBEROS_FLAG) cfg.kerberos = true;
+  if (GSSAPI_DELEGATE) cfg.gssapiDelegateCredentials = GSSAPI_DELEGATE as 'yes' | 'no';
+  if (KNOWN_HOSTS_FILE) cfg.knownHostsFile = KNOWN_HOSTS_FILE;
+  if (STRICT_HOST_KEY) cfg.strictHostKeyChecking = STRICT_HOST_KEY as 'yes' | 'no' | 'accept-new';
+  return cfg;
+}
+
+const cliSourceConfigs: ServerConfig[] = (() => {
+  if (isMultiHost) {
+    return sshJsonArgs.map(raw => parseServerConfigJson(raw));
+  }
+  if (hasLegacyCli) {
+    const legacy = buildLegacyServerConfig();
+    return legacy ? [legacy] : [];
+  }
+  return [];
+})();
+
+/**
+ * Resolve the explicit `--config` path from parsed argv.
+ *
+ * `parseArgv` records a value-less `--config` (no `=path`) as `null`. Silently
+ * coercing that to `undefined` would drop the explicit flag and fall back to
+ * `SSH_MCP_CONFIG`/default discovery, so a mistyped `--config` could start the
+ * process against the wrong configured source instead of failing fast. Reject a
+ * present-but-value-less `--config` like the other value-requiring flags.
+ * Returns the path when supplied, or `undefined` when the flag is absent.
+ */
+export function resolveCliConfigPath(
+  config: Record<string, string | null>,
+): string | undefined {
+  if (!('config' in config)) return undefined;
+  const value = config.config;
+  if (typeof value !== 'string') {
+    throw new Error('Configuration error:\n--config requires a value (--config=<path>)');
+  }
+  // `--config=` parses as an empty string. resolveConfig treats a truthy
+  // explicit path as the config to load but skips loadTomlFile for a falsy one,
+  // so an empty value would start the process while silently dropping the
+  // intended TOML top-level settings/discovery. Treat '' like the value-less
+  // `--config` case and fail fast (Codex 3541772406).
+  if (value === '') {
+    throw new Error('Configuration error:\n--config requires a value (--config=<path>)');
+  }
+  return expandHome(value);
+}
+
+const explicitConfigPath = (isCliEnabled || isTestMode)
+  ? resolveCliConfigPath(argvConfig)
+  : undefined;
+
+const resolvedConfig: ResolvedConfig = (isCliEnabled || isTestMode)
+  ? resolveConfig({
+      cliSources: cliSourceConfigs,
+      cliConfigPath: explicitConfigPath,
+      // An explicit CLI switch overrides TOML in either direction. Preserve
+      // `undefined` when the switch is absent so the loader can still honor
+      // `[webui].enabled`; bare `--webui` forces true and `--webui=false`
+      // forces false before token resolution and boot validation.
+      webuiEnabled: cliSwitchOverride(argvConfig, 'webui'),
+    })
+  : { sources: [], perSourceApproval: {}, defaultExplicit: false, requireConnection: true };
 
 if (isCliEnabled) {
-  validateConfig(argvConfig, isMultiHost);
+  if (!isMultiHost && !hasLegacyCli && resolvedConfig.sources.length === 0) {
+    throw new Error(
+      'Configuration error:\nMissing required --host (or use --ssh=<JSON>, --config=<path>, SSH_MCP_CONFIG, or a default ssh-mcp config.toml)',
+    );
+  }
 }
 
 export function sanitizeCommand(command: string): string {
@@ -485,7 +638,6 @@ export async function buildTransportConfig(
 // Transport registry — lazy init, single entry for legacy single-host mode.
 // =============================================================================
 
-const fileLoadedKeyConfigs = new WeakSet<ServerConfig>();
 const registry = new TransportRegistry(prepareKeyContents);
 
 export async function prepareKeyContents(cfg: ServerConfig): Promise<void> {
@@ -499,89 +651,790 @@ export async function prepareKeyContents(cfg: ServerConfig): Promise<void> {
   //
   // Once this hook loads a keyPath, re-read it on every later init attempt. The
   // registry retries rejected initialization with the same config object; the
-  // WeakSet distinguishes file-loaded contents from an explicit inline key so a
-  // key rotation can recover without a process restart.
+  // internal marker distinguishes file-loaded contents from an explicit inline
+  // key so a key rotation can recover without a process restart.
   if (
     cfg.authMode === 'key' &&
     cfg.transport === 'ssh2' &&
     cfg.keyPath &&
-    (!cfg.privateKey || fileLoadedKeyConfigs.has(cfg))
+    (!cfg.privateKey || cfg.privateKeyDerivedFromKeyPath === true)
   ) {
     const fs = await import('fs/promises');
     cfg.privateKey = await fs.readFile(cfg.keyPath, 'utf8');
-    fileLoadedKeyConfigs.add(cfg);
+    cfg.privateKeyDerivedFromKeyPath = true;
   }
 }
 
 async function bootstrapRegistry(): Promise<void> {
-  if (isMultiHost) {
-    for (const raw of sshJsonArgs) {
-      const cfg = parseServerConfigJson(raw);
-      // Do NOT read key files here — prepareKeyContents is deferred to the
-      // registry's lazy get(name) path (passed as the registry's prepareConfig
-      // hook), so one host with a missing/unmounted key path can't break
-      // startup or list-servers for the other, healthy hosts.
-      registry.register(cfg);
-    }
-  } else {
-    if (!HOST || !USER) return; // Test mode with no CLI — tools will error if called
-    // Route the legacy single-host path through buildTransportConfig so it
-    // inherits the kerberos>password>key precedence. Pass deferKeyRead so the
-    // ssh2 key file is NOT read at startup: prepareKeyContents (the registry's
-    // lazy prepareConfig hook) reads it on the first tool call instead, exactly
-    // like the multi-host path. This preserves the pre-registry behavior where
-    // the key was read only inside getOrCreateTransport(), so a key-based
-    // deployment whose secret mount appears after process launch still starts
-    // (Codex 3541767256).
-    const tcfg = await buildTransportConfig({
-      host: HOST,
-      port: PORT,
-      username: USER,
-      password: PASSWORD,
-      key: KEY,
-      suPassword: SUPASSWORD,
-      sudoPassword: SUDOPASSWORD,
-      kerberos: KERBEROS_FLAG,
-      transportFlag: TRANSPORT_FLAG,
-      gssapiDelegateCredentials: GSSAPI_DELEGATE,
-      knownHostsFile: KNOWN_HOSTS_FILE,
-      strictHostKeyChecking: STRICT_HOST_KEY,
-    }, { deferKeyRead: true });
-    registry.register({ ...tcfg, name: 'default' });
+  // Unified bootstrap (toml-config design): resolvedConfig.sources already
+  // carries every registered host — multi-host --ssh JSON, the legacy
+  // single-host config, and any [[sources]] from a TOML — built by
+  // resolveConfig(). Iterate it as the single source of truth. The
+  // kerberos>password>key precedence and gated key read from PR #2/#3 are
+  // preserved via buildLegacyServerConfig (uses resolveAuthMode).
+  //
+  // Key reads are DEFERRED: prepareKeyContents is passed as the registry's
+  // lazy prepareConfig hook (see `new TransportRegistry(prepareKeyContents)`)
+  // and runs inside get(name), not here — so one host with a missing/unmounted
+  // key path can't break startup or list-servers for the other healthy hosts
+  // (multi-host R2 hardening carried forward from pr/multi-host).
+  for (const cfg of resolvedConfig.sources) {
+    registry.register(cfg);
+  }
+  applyRegistryConnectionPolicy(registry, resolvedConfig);
+}
+
+/**
+ * Wire the resolved connection policy onto a registry whose sources are already
+ * registered. Split out (and exported) so the explicit-default / fallback /
+ * require_connection opt-out matrix is unit-testable without booting the server.
+ *
+ * Two independent knobs:
+ *  - defaultExplicit: call setDefault() ONLY when the user explicitly chose a
+ *    default. Falling through to register()'s first-registered fallback leaves
+ *    the registry's defaultExplicit=false, so a multi-source config with no
+ *    explicit default still rejects an omitted connectionName (the headline
+ *    security fix) instead of silently routing to the first host.
+ *  - requireConnection: when false, opt out of that guard entirely. Absent the
+ *    field (older ResolvedConfig shape / no [server].require_connection) it
+ *    defaults to safe (guard ON).
+ */
+export function applyRegistryConnectionPolicy(
+  reg: Pick<TransportRegistry, 'setDefault' | 'setRequireConnectionWhenMulti'>,
+  config: ResolvedConfig,
+): void {
+  const requireConnection = config.requireConnection ?? true;
+  reg.setRequireConnectionWhenMulti(requireConnection);
+  if (config.defaultExplicit && config.defaultName) {
+    reg.setDefault(config.defaultName);
   }
 }
 
+/**
+ * Profile label used before registry target resolution succeeds.
+ *
+ * Match TransportRegistry.resolveRegisteredName() exactly: only a falsy name
+ * is omitted. In particular, whitespace is a supplied (invalid) name, so a
+ * rejected call must remain attributed to that unresolved value instead of a
+ * real default host.
+ */
+export function preResolutionProfileName(
+  connectionName: string | undefined,
+  defaultName: string | null,
+  wouldRejectOmittedName: boolean,
+): string {
+  if (connectionName) return connectionName;
+  // An omitted/blank name that the registry would REJECT (multi-source, no
+  // explicit default, guard on) never lands on a host: resolveName() throws
+  // before selection. Attributing that rejected call to getDefaultName() (the
+  // first-registered host) would corrupt audit profile for exactly the guard
+  // case. Mirror the guard and label it unresolved instead of a real host.
+  if (wouldRejectOmittedName) return '(unresolved)';
+  return defaultName ?? 'default';
+}
+
+/** Effective profile/connection name for gating + audit attribution. */
 function resolvedProfileName(connectionName?: string): string {
-  // Delegate to the registry's non-throwing resolver so an ambiguous
-  // multi-host call (name omitted, >1 server, no explicit default) is recorded
-  // as '(unresolved)' instead of being misattributed to the first server on the
-  // failure-audit path.
-  return registry.resolveProfileName(connectionName);
+  return preResolutionProfileName(
+    connectionName,
+    registry.getDefaultName(),
+    registry.wouldRejectOmittedName(),
+  );
+}
+
+export function buildApprovalProfile(
+  id: string,
+  perSourceApproval: Record<string, ApprovalMode> = {},
+  source?: { description?: string },
+): ResolvedSource {
+  const mode = Object.prototype.hasOwnProperty.call(perSourceApproval, id)
+    ? perSourceApproval[id]
+    : undefined;
+  return {
+    id,
+    ...(source?.description ? { description: source.description } : {}),
+    ...(mode ? { approval: { mode } } : {}),
+  };
+}
+
+/**
+ * Finding-4 (Codex R4) revalidation after an awaited approval.
+ *
+ * A manual/smart approval can block for a long time. During that wait a config
+ * hot-reload (closeAll bumps the registry's reload generation) can remove or
+ * re-parameterize the source, but the transport `current` was already dialed
+ * against the PRE-approval config. Running the approved command on it would
+ * bypass the swap (execute on a stale host, or on a source that no longer
+ * exists). Compare the generation captured BEFORE the approval against the live
+ * one: if it changed, re-acquire the transport against the CURRENT config
+ * (registry.get() re-resolves the name — throwing a clear error if it was
+ * removed — and re-dials the new params) and re-sample the profile so audit
+ * attribution matches the transport actually used.
+ *
+ * Returns the transport to execute with and its effective audit profile id.
+ * When no reload landed, returns the originals unchanged (single sync generation
+ * read — no await — so no further reload can interleave before the caller runs).
+ */
+export async function reacquireTransportIfReloaded(
+  reg: Pick<TransportRegistry, 'getReloadGeneration' | 'get' | 'profile'>,
+  connectionName: string | undefined,
+  current: ISshTransport,
+  generationBeforeApproval: number,
+): Promise<{ transport: ISshTransport; profile: string }> {
+  if (reg.getReloadGeneration() === generationBeforeApproval) {
+    return { transport: current, profile: reg.profile(connectionName).id };
+  }
+  const transport = await reg.get(connectionName);
+  return { transport, profile: reg.profile(connectionName).id };
+}
+
+/**
+ * Approve and acquire one stable source across config reloads.
+ *
+ * The canonical source id is sampled before the first await. Every attempt gates
+ * that source before registry.get() can initialize/elevate a transport. If a
+ * reload lands during either await, the decision/transport is discarded and the
+ * same source id is re-profiled and re-approved; it is never reinterpreted as a
+ * new default.
+ */
+export async function approveTransportForCurrentConfig(params: {
+  reg: Pick<TransportRegistry, 'getReloadGeneration' | 'get' | 'profile'>;
+  profile: ResolvedSource;
+  gate: (profile: ResolvedSource) => Promise<ApprovalDecision>;
+  maxAttempts?: number;
+}): Promise<{ transport: ISshTransport; profile: string; approval: ApprovalDecision }> {
+  let effectiveProfile = params.profile;
+  const resolvedName = params.profile.id;
+  const maxAttempts = params.maxAttempts ?? 10;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const generationBeforeApproval = params.reg.getReloadGeneration();
+    let approval: ApprovalDecision;
+    try {
+      approval = await params.gate(effectiveProfile);
+    } catch (err) {
+      if (params.reg.getReloadGeneration() === generationBeforeApproval) {
+        throw err;
+      }
+      // The old denial/timeout was invalidated by reload. Re-profile the SAME
+      // canonical source before retrying; a removed source fails closed here.
+      effectiveProfile = params.reg.profile(resolvedName);
+      continue;
+    }
+
+    if (params.reg.getReloadGeneration() !== generationBeforeApproval) {
+      effectiveProfile = params.reg.profile(resolvedName);
+      continue;
+    }
+
+    // Approval is current, so transport initialization/elevation may proceed.
+    let transport: ISshTransport;
+    try {
+      transport = await params.reg.get(resolvedName);
+    } catch (err) {
+      // The operator's decision DID happen. A failed acquisition (unreadable
+      // lazy key, connect failure, source removed after the approval) must not
+      // silently discard it: attach the decision to the error so both tool
+      // handlers' catch paths (getApprovalDecisionFromError) audit the real
+      // decision instead of recording a synthetic `approval:not-run` denial.
+      if (err !== null && typeof err === 'object'
+          && (err as { approval?: ApprovalDecision }).approval === undefined) {
+        (err as { approval?: ApprovalDecision }).approval = approval;
+      }
+      throw err;
+    }
+    if (params.reg.getReloadGeneration() === generationBeforeApproval) {
+      return { transport, profile: effectiveProfile.id, approval };
+    }
+
+    // A reload landed while get() was initializing. Registry.get() already
+    // discarded/retried stale transport state; loop to authorize the current
+    // transport configuration before execution.
+    effectiveProfile = params.reg.profile(resolvedName);
+  }
+
+  throw new Error(`config reloaded ${maxAttempts} times during approval; retry command after reloads settle`);
+}
+
+export function approvalTargetForConnection(
+  reg: TransportRegistry,
+  connectionName?: string,
+): { profile: string; approvalProfile: ResolvedSource } {
+  const id = reg.resolveRegisteredName(connectionName);
+  // Registry state is the hot-reload source of truth; resolvedConfig is the boot
+  // snapshot and may no longer describe this source.
+  return { profile: id, approvalProfile: reg.profile(id) };
+}
+
+export function appendDescriptionComment(command: string, description?: string): string {
+  if (!description) return command;
+  const safeDescription = description
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/[\t\f\v ]+/g, ' ')
+    .trim();
+  return safeDescription ? `${command} # ${safeDescription}` : command;
+}
+
+// =============================================================================
+// Approval engine + OPTIONAL audit-truth seam (Decision D2).
+//
+// The approval engine is the source of truth for whether a command runs. The
+// audit seam is OPTIONAL: when `src/audit/` is part of the build it logs the
+// real decision; when absent (e.g. on `pr/toml-config`, this lane's base) it
+// no-ops. `auditSink` starts as a no-op so the exec/sudo-exec handlers can call
+// it unconditionally; `wireApprovalAndAudit()` upgrades it at boot.
+// =============================================================================
+
+let approvalEngine: ApprovalDispatcher | null = null;
+let auditSink: AuditSink = { record() { /* no-op until wired (or audit absent) */ } };
+
+/**
+ * Resolve the [approval]/per-source config into the concrete engine input.
+ * Returns null for the legacy CLI path (no [approval] section and no per-source
+ * overrides). Shared by buildProductionApprovalEngine (which builds the engine)
+ * and wireApprovalAndAudit (which reuses the SAME resolved defaultMode +
+ * perSourceModes for the manual-without-resolver boot warning) so the warning
+ * can never disagree with the mode the engine actually runs.
+ */
+export function resolveApprovalEngineInput(
+  config: ResolvedConfig = resolvedConfig,
+): BuildEngineFromConfigInput | null {
+  // Delegate to the shared pure resolver so this boot path and the config
+  // hot-reload path (src/config/reloader.ts) can NEVER disagree about how a
+  // ResolvedConfig maps to the effective default/per-source modes. See
+  // src/config/approval-policy.ts for the precedence rationale.
+  return resolveApprovalEngineInputForConfig(config);
+}
+
+/** Effective configured mode used when audit must record a pre-gate failure. */
+export function resolveConfiguredApprovalMode(
+  profileId: string,
+  config: ResolvedConfig = resolvedConfig,
+): ApprovalMode {
+  const input = resolveApprovalEngineInput(config);
+  if (input === null) return 'yolo';
+  const profile = buildApprovalProfile(
+    profileId,
+    config.perSourceApproval ?? {},
+  );
+  return profile.approval?.mode ?? input.defaultMode ?? 'manual';
+}
+
+/** Effective live mode used when audit must record a pre-gate failure. */
+export function resolveLiveApprovalMode(
+  profileId: string,
+  engine: Pick<ApprovalDispatcher, 'getEffectiveMode'> | null,
+): ApprovalMode {
+  return engine?.getEffectiveMode(profileId) ?? 'yolo';
+}
+
+export function approvalResolverWarningFromInput(
+  input: BuildEngineFromConfigInput | null,
+  params: { webuiEnabled: boolean; resolverWired: boolean },
+): string | null {
+  if (input === null) return null;
+  return manualWithoutResolverWarning({
+    webuiEnabled: params.webuiEnabled,
+    defaultMode: input.defaultMode,
+    perSourceModes: input.perSourceModes,
+    resolverWired: params.resolverWired,
+  });
+}
+
+/**
+ * Build the production approval engine from resolvedConfig. Returns null for
+ * the legacy CLI path (no [approval] section and no per-source overrides) so
+ * the gate keeps its backward-compatible `legacy:no-engine` allow.
+ *
+ * Throws (fatal at boot):
+ *   - manual mode requested but WebUI disabled (gate-12 invariant)
+ *   - smart mode requested but [approval.llm] missing endpoint or model
+ */
+export function buildProductionApprovalEngine(
+  webuiActive: boolean,
+  config: ResolvedConfig = resolvedConfig,
+): ApprovalDispatcher | null {
+  const approvalCfg = config.approval;
+  const perSourceApproval = config.perSourceApproval ?? {};
+  const perSourceModes: ApprovalMode[] = Object.values(perSourceApproval);
+  const approvalLlmOnly = approvalCfg !== undefined
+    && approvalCfg.mode === undefined
+    && approvalCfg.fail_closed === undefined
+    && approvalCfg.llm !== undefined;
+  // A synthetic engine has no selected approval mode. It exists only while the
+  // WebUI is active so operators can live-switch from the legacy yolo baseline.
+  // Preserve an LLM-only block on that engine so a supported smart provider is
+  // switchable without turning the otherwise-inert config into a boot-time mode.
+  const isSyntheticWebUIEngine = perSourceModes.length === 0
+    && (approvalCfg === undefined || approvalLlmOnly);
+
+  // Resolve config through the SHARED helper so the engine we build and the
+  // manual-without-resolver boot warning (wireApprovalAndAudit) can never
+  // disagree about the effective default/per-source modes. It returns null on
+  // the legacy CLI and LLM-only paths; keep that no-engine allow UNLESS the
+  // WebUI is active and wants a live-switchable synthetic engine.
+  const resolved = resolveApprovalEngineInput(config);
+  if (resolved === null && !(isSyntheticWebUIEngine && webuiActive)) {
+    return null;
+  }
+  const input: BuildEngineFromConfigInput = {
+    ...(resolved ?? (approvalLlmOnly ? { llm: approvalCfg?.llm } : {})),
+    // For a synthetic WebUI engine, pass an explicit `yolo` baseline. Leaving
+    // this undefined makes buildApprovalEngineFromConfig coerce it to `manual`,
+    // which would enqueue/block every exec even though no approval mode was
+    // configured. Per-source and explicit [approval].mode configs keep the
+    // resolved default from the shared helper.
+    defaultMode: resolved?.defaultMode ?? (isSyntheticWebUIEngine ? 'yolo' : undefined),
+    // Seed per-source static overrides into the live mode store so a live mode
+    // switch starts from the operator's configured baseline (mode-switch lane).
+    staticOverrides: perSourceApproval,
+  };
+  return buildApprovalEngineFromConfig(input, {
+    manualOpts: { webuiEnabled: webuiActive },
+  });
+}
+
+/** Return the explicit value of a bare/string boolean CLI switch, or undefined when absent. */
+function cliSwitchOverride(args: Record<string, unknown>, key: string): boolean | undefined {
+  if (!(key in args)) return undefined;
+  const value = args[key];
+  return !(typeof value === 'string' && value.toLowerCase() === 'false');
+}
+
+/** Resolve a bare/string boolean CLI switch without treating `--flag=false` as enabled. */
+export function isCliSwitchEnabled(args: Record<string, unknown>, key: string): boolean {
+  return cliSwitchOverride(args, key) === true;
+}
+
+/** Decide whether the WebUI will be active at boot (TOML or --webui). */
+function isWebUIActive(): boolean {
+  // CLI presence wins in either direction: bare `--webui` enables the server,
+  // while explicit `--webui=false` suppresses even TOML enabled=true. Only an
+  // absent CLI switch delegates to the TOML setting.
+  return cliSwitchOverride(argvConfig, 'webui')
+    ?? (resolvedConfig.webui?.enabled === true);
+}
+
+/**
+ * True when a driver that settles the manual-approval queue is wired into this
+ * build. This lane includes the WebUI manual-approval POST route and passes the
+ * in-process ApprovalDispatcher through buildWebUIApprovalQueueAdapter(), so a
+ * WebUI-enabled manual queue has a resolver.
+ */
+function isApprovalResolverWired(): boolean {
+  return true;
+}
+
+/**
+ * Wire the approval engine into the gate and load the optional audit sink.
+ * Safe to call before the MCP transport connects so the first exec is gated.
+ */
+async function wireApprovalAndAudit(): Promise<void> {
+  // Keep the module-level `approvalEngine` binding: the read-only WebUI wiring
+  // downstream (makeApprovalModeLookup + buildWebUIApprovalQueueAdapter) reads
+  // it to surface the live engine to the dashboard.
+  const webuiActive = isWebUIActive();
+  approvalEngine = buildProductionApprovalEngine(webuiActive);
+
+  // Non-fatal boot advisory: manual mode boots a queue with no driver when the
+  // approval-engine lane runs standalone, ahead of its child WebUI lane. Boot
+  // still succeeds (the queue exists, it just times out until a resolver lands);
+  // warn so the operator is not left wondering why every command hangs.
+  const input = resolveApprovalEngineInput();
+  const warning = approvalResolverWarningFromInput(input, {
+    webuiEnabled: webuiActive,
+    resolverWired: isApprovalResolverWired(),
+  });
+  if (warning) {
+    console.error(`WARN: ${warning}`);
+  }
+  setApprovalEngine(approvalEngine);
+  auditSink = await loadAuditSink({
+    auditDir: resolvedConfig.server?.audit_dir,
+    auditMaxBytes: resolvedConfig.server?.audit_max_bytes,
+  });
+}
+
+/** Bridge the in-process approval dispatcher to the read-only WebUI queue shape. */
+export function buildWebUIApprovalQueueAdapter(engine: ApprovalDispatcher | null): ManualApprovalQueue | undefined {
+  if (!engine) return undefined;
+
+  const enqWrappers = new Map<Function, (p: any) => void>();
+  const resWrappers = new Map<Function, (p: any, d: any) => void>();
+  const toBoundedWebUIText = (value: string): string =>
+    capThenRedact(value, AUDIT_COMMAND_MIN_CAP_BYTES).text;
+  const toWebUI = (p: any): WebUIPendingApproval => {
+    const description = p.context?.description;
+    return {
+      id: p.id,
+      profile: p.context?.profile?.id ?? 'default',
+      tool: p.context?.tool ?? 'exec',
+      command: toBoundedWebUIText(p.context?.command ?? ''),
+      description: description === undefined ? undefined : toBoundedWebUIText(description),
+      enqueuedAt: p.enqueued_at,
+    };
+  };
+
+  return {
+    list: () => engine.listPending().map(toWebUI),
+    resolve: (id, decision: WebUIApprovalDecision) =>
+      engine.resolvePending(id, decision.decision, decision.reason, decision.decided_by),
+    on(event, listener) {
+      if (event === 'enqueue') {
+        const wrap = (p: any) => (listener as (p: WebUIPendingApproval) => void)(toWebUI(p));
+        enqWrappers.set(listener, wrap);
+        engine.on('enqueue', wrap);
+      } else if (event === 'resolve') {
+        const wrap = (p: any, d: WebUIApprovalDecision) =>
+          (listener as (p: WebUIPendingApproval, d: WebUIApprovalDecision) => void)(toWebUI(p), d);
+        resWrappers.set(listener, wrap);
+        engine.on('resolve', wrap);
+      }
+    },
+    off(event, listener) {
+      if (event === 'enqueue') {
+        const wrap = enqWrappers.get(listener);
+        if (wrap) {
+          engine.off('enqueue', wrap);
+          enqWrappers.delete(listener);
+        }
+      } else if (event === 'resolve') {
+        const wrap = resWrappers.get(listener);
+        if (wrap) {
+          engine.off('resolve', wrap);
+          resWrappers.delete(listener);
+        }
+      }
+    },
+  };
+}
+
+/** Bridge the optional audit seam to the read-only WebUI audit tail shape. */
+function buildWebUIAuditTailAdapter(sink: AuditSink): WebUIAuditTail | undefined {
+  if (typeof sink.tail !== 'function' || typeof sink.on !== 'function') return undefined;
+
+  const toWebUI = (r: any) => ({
+    ts: r.ts,
+    id: r.id,
+    profile: r.profile,
+    tool: r.tool,
+    command: r.command,
+    description: r.description,
+    approval: r.approval,
+    exec: r.exec
+      ? {
+          exit_code: r.exec.exit_code ?? undefined,
+          duration_ms: r.exec.duration_ms,
+          stdout_truncated: r.exec.stdout_truncated,
+          stderr_truncated: r.exec.stderr_truncated,
+          stdout: r.exec.stdout,
+          stderr: r.exec.stderr,
+        }
+      : undefined,
+  });
+  const listenerMap = new Map<Function, (r: unknown) => void>();
+
+  return {
+    tail: async opts => {
+      const records = await sink.tail!(opts);
+      return records.map(toWebUI);
+    },
+    on: (event, listener) => {
+      const wrap = (r: unknown) => listener(toWebUI(r));
+      listenerMap.set(listener, wrap);
+      sink.on!(event, wrap);
+    },
+    off: (event, listener) => {
+      const wrap = listenerMap.get(listener);
+      if (wrap && typeof sink.off === 'function') {
+        sink.off(event, wrap);
+        listenerMap.delete(listener);
+      }
+    },
+  };
+}
+
+export function makeApprovalModeLookup(
+  deps: {
+    perSourceApproval?: Record<string, ApprovalMode>;
+    getEngine?: () => Pick<ApprovalDispatcher, 'defaultMode'> | null;
+    modeController?: Pick<WebUIModeController, 'getEffectiveMode'>;
+  } = {},
+): (profileName: string) => string {
+  const perSource = deps.perSourceApproval ?? resolvedConfig.perSourceApproval ?? {};
+  // Engine read stays lazy (per lookup, like the previous module-level read)
+  // so the adapter never caches a stale null/instance across engine wiring.
+  const getEngine = deps.getEngine ?? (() => approvalEngine);
+  // Production passes the same live controller used by the mutation routes.
+  // Its dispatcher-backed lookup observes in-memory profile/global changes made
+  // after startup instead of falling back to the static TOML snapshot below.
+  const modeController = deps.modeController;
+  if (modeController) {
+    return (name: string): string => modeController.getEffectiveMode(name);
+  }
+  // Mirror exactly what ApprovalDispatcher.decide() enforces so the WebUI
+  // never advertises a gate that is not actually applied:
+  //   - no engine wired        -> gateApproval() takes the legacy no-engine
+  //                               allow path (yolo-equivalent);
+  //   - per-source override set -> decide() honors ctx.profile.approval.mode,
+  //                               which the handlers thread in via
+  //                               approvalProfileForConnection();
+  //   - otherwise               -> decide() falls back to the engine's own
+  //                               resolved default mode.
+  return (name: string): string => {
+    const engine = getEngine();
+    if (!engine) return 'yolo';
+    // Own-property check like buildApprovalProfile(): a profile named
+    // `toString`/`constructor`/another Object.prototype key must not read the
+    // inherited member off the plain override object — /api/profiles would
+    // then serialize a function/object instead of falling back to the
+    // engine's default mode that decide() actually enforces (Codex 3568536828).
+    return Object.prototype.hasOwnProperty.call(perSource, name)
+      ? perSource[name]
+      : engine.defaultMode;
+  };
+}
+
+/**
+ * Bridge the in-process dispatcher to the WebUI's ModeController contract
+ * (PR-7). All mutation is in-memory only (Decision D3): this adapter calls the
+ * dispatcher's mode store, which never touches disk. Returns undefined when no
+ * engine is wired (mode switching disabled).
+ */
+function buildWebUIModeController(engine: ApprovalDispatcher | null): WebUIModeController | undefined {
+  if (!engine) return undefined;
+  const wrappers = new Map<Function, (e: any) => void>();
+  return {
+    availableModes: () => engine.availableModes(),
+    getGlobalMode: () => engine.getGlobalMode(),
+    getEffectiveMode: (profileId: string) => engine.getEffectiveMode(profileId),
+    setProfileMode: (profileId: string, mode: string | null) =>
+      engine.setProfileMode(profileId, mode as ApprovalMode | null),
+    setGlobalMode: (mode: string) => engine.setGlobalMode(mode as ApprovalMode),
+    on(event, listener) {
+      const wrap = (e: any) => listener(e);
+      wrappers.set(listener, wrap);
+      engine.on(event, wrap);
+    },
+    off(event, listener) {
+      const wrap = wrappers.get(listener);
+      if (wrap) {
+        engine.off(event, wrap);
+        wrappers.delete(listener);
+      }
+    },
+  };
+}
+
+/**
+ * Bridge the TransportRegistry's in-memory description override to the WebUI's
+ * SourceController contract (PR-8). All mutation is in-memory only (Decision
+ * D3): `registry.setDescription()` updates a Map and NEVER writes the TOML
+ * config. The approval engine re-reads the effective description on its next
+ * decision because `registry.profile()` applies the override on every call —
+ * so an edit takes effect live without a restart. This adapter owns the
+ * `source-updated` fan-out (the registry is a pure state-holder, like the
+ * ApprovalModeStore beneath the mode controller).
+ */
+function buildWebUISourceController(reg: TransportRegistry): WebUISourceController {
+  const listeners = new Set<(e: WebUISourceUpdatedEvent) => void>();
+  return {
+    hasSource: (id: string) => reg.names().includes(id),
+    getEffectiveDescription: (id: string) => reg.getEffectiveDescription(id),
+    setDescription(id: string, description: string | null): WebUISourceUpdatedEvent {
+      const effective = reg.setDescription(id, description);
+      const event: WebUISourceUpdatedEvent = {
+        id,
+        description: effective,
+        at: new Date().toISOString(),
+      };
+      for (const l of listeners) {
+        try { l(event); } catch { /* a bad listener must not break the edit */ }
+      }
+      return event;
+    },
+    on(_event, listener) {
+      listeners.add(listener);
+    },
+    off(_event, listener) {
+      listeners.delete(listener);
+    },
+  };
+}
+
+// =============================================================================
+// Config hot-reload (PR-9). The reloader owns the parse→validate→swap→rollback
+// transaction; the watcher debounces fs.watch and drives it. Reload scope =
+// connections + per-source description + approval policy. The MCP tool list is
+// NEVER reloaded (Decision D4) — it is static and registered once at startup,
+// so STDIO clients need no reconnect. All mutation is in-memory (D3): a reload
+// reseeds from the file but writes nothing back, so it can't loop the watcher.
+// =============================================================================
+
+let configReloader: ConfigReloader | null = null;
+let stopConfigWatcher: (() => void) | null = null;
+
+/**
+ * Re-resolve the boot config from disk using the same precedence chain as
+ * startup. For an explicit `--config` paired with `--ssh`/legacy CLI sources,
+ * `cliSources` is retained so only the TOML top-level policy is reloaded and
+ * the file's suppressed `[[sources]]` never replaces the CLI transports. Throws
+ * on any parse/validation error — the reloader keeps the old config.
+ */
+export function resolveReloadConfig(params: {
+  cliSources: ServerConfig[];
+  configPath: string;
+  cliArgs: Record<string, unknown>;
+  env?: NodeJS.ProcessEnv;
+}): ResolvedConfig {
+  return resolveConfig({
+    cliSources: params.cliSources,
+    cliConfigPath: params.configPath,
+    // Keep the CLI switch tri-state identical to startup: absent delegates to
+    // TOML, a bare --webui forces true, and --webui=false forces false.
+    webuiEnabled: cliSwitchOverride(params.cliArgs, 'webui'),
+    env: params.env,
+  });
+}
+
+function reloadResolveConfig(): ResolvedConfig {
+  return resolveReloadConfig({
+    cliSources: cliSourceConfigs,
+    // Pin reloads to the EXACT file the boot resolver settled on (the same file
+    // the watcher is attached to), NOT the raw `--config` flag. CONFIG_PATH is
+    // undefined for env-var (`SSH_MCP_CONFIG`) and default-discovered boots, so
+    // passing it would make the reloader RE-RUN discovery: if a higher-
+    // precedence config (e.g. an explicit `--config`-style path, or an
+    // `SSH_MCP_CONFIG` that appeared in the environment) showed up after boot,
+    // an edit to the WATCHED file could end up applying a DIFFERENT file.
+    // `resolvedConfig.configPath` is the absolute path resolved at startup;
+    // feeding it back as the highest-precedence input keeps the loader and the
+    // watcher pinned to one file for the whole process lifetime.
+    configPath: resolvedConfig.configPath!,
+    // Preserve the startup CLI override in BOTH directions so reload validation
+    // sees the same effective WebUI state as a fresh boot. Passing the parsed
+    // argv through the shared tri-state parser is load-bearing: key presence
+    // alone would misread --webui=false as enabled, while coercing an absent
+    // switch to false would suppress TOML enabled=true.
+    cliArgs: argvConfig,
+  });
+}
+
+/**
+ * Decide whether the resolved config path is an authoritative hot-reload input.
+ * TOML-driven boots always qualify. CLI-source boots qualify only when the user
+ * explicitly supplied `--config`; auto-discovered files must not become live
+ * policy inputs (or weaken CLI connection guards) merely because they exist.
+ */
+export function shouldWatchResolvedConfig(params: {
+  configPath?: string;
+  cliSourceCount: number;
+  explicitConfigPath?: string;
+}): boolean {
+  if (!params.configPath) return false;
+  return params.cliSourceCount === 0 || params.explicitConfigPath !== undefined;
+}
+
+/** Build the ConfigReloader bound to the live registry + approval engine. */
+function buildConfigReloader(): ConfigReloader | null {
+  if (!shouldWatchResolvedConfig({
+    configPath: resolvedConfig.configPath,
+    cliSourceCount: cliSourceConfigs.length,
+    explicitConfigPath,
+  })) return null;
+  return new ConfigReloader({
+    registry,
+    loadConfig: reloadResolveConfig,
+    engine: approvalEngine ?? undefined,
+    // NOTE: deliberately NO `prepareSources` hook here. Key reading stays LAZY
+    // on reload, exactly like boot: the live `registry` was constructed with
+    // `prepareKeyContents` as its per-host `prepareConfig` hook (see
+    // `new TransportRegistry(prepareKeyContents)`), which runs inside get(name)
+    // for whichever host is actually selected — and survives reloads because
+    // replaceAll() only swaps configs, never the registry instance. Eagerly
+    // running prepareKeyContents() over EVERY new source here (the old
+    // behaviour) made one source with an unreadable/unmounted ssh2 key throw
+    // mid-swap and roll back the ENTIRE reload — including edits to unrelated
+    // healthy sources — a divergence from boot, where a bad key only fails when
+    // that specific host is used. Leaving it lazy keeps reload and boot on the
+    // same failure-isolation contract (multi-host R2 hardening).
+  });
+}
+
+/** Adapt the ConfigReloader (an EventEmitter) to the WebUI's read-only controller. */
+function buildWebUIReloadController(reloader: ConfigReloader | null): WebUIConfigReloadController | undefined {
+  if (!reloader) return undefined;
+  const wrappers = new Map<Function, (e: any) => void>();
+  return {
+    on(event, listener) {
+      const wrap = (e: any) => listener(e);
+      wrappers.set(listener, wrap);
+      reloader.on(event, wrap);
+    },
+    off(event, listener) {
+      const wrap = wrappers.get(listener);
+      if (wrap) {
+        reloader.off(event, wrap);
+        wrappers.delete(listener);
+      }
+    },
+  };
+}
+
+async function maybeStartWebUI(): Promise<{ close(): Promise<void> } | undefined> {
+  if (!isWebUIActive()) return undefined;
+
+  const tomlWebui = resolvedConfig.webui;
+  const host = tomlWebui?.host ?? '127.0.0.1';
+  const port = tomlWebui?.port ?? 8088;
+  const authToken = tomlWebui?.auth_token;
+
+  const modeController = buildWebUIModeController(approvalEngine);
+  const handle = await startWebUI({
+    host,
+    port,
+    authToken,
+    cors: tomlWebui?.cors,
+    registry: { list: () => registry.list() },
+    queue: buildWebUIApprovalQueueAdapter(approvalEngine),
+    audit: buildWebUIAuditTailAdapter(auditSink),
+    getApprovalMode: makeApprovalModeLookup({ modeController }),
+    modeController,
+    sourceController: buildWebUISourceController(registry),
+    reloadController: buildWebUIReloadController(configReloader),
+  });
+  const tokenStatus = authToken ? 'token required' : 'anonymous loopback';
+  console.error(`SSH MCP WebUI running on http://${handle.address.host}:${handle.address.port}/ — ${tokenStatus}`);
+  return handle;
 }
 
 function auditExecution(params: {
-  tool: AuditTool;
+  tool: 'exec' | 'sudo-exec';
   profile: string;
   command: string;
   description?: string;
   startedAt: number;
   result?: ExecResult;
   error?: unknown;
-  store?: AuditStore;
+  store: { append(record: unknown): unknown };
 }): void {
   const now = new Date();
   const durationMs = Math.max(0, Date.now() - params.startedAt);
   try {
-    // Resolve the store inside the try: lazily constructing it can throw when
-    // the audit directory is unwritable, and audit logging is best-effort —
-    // a store-construction failure must not surface to the caller either.
-    const store = params.store ?? getAuditStore();
-    store.append({
+    // Append inside the try: audit logging is best-effort — a store failure
+    // must be visible but should not hide the real SSH result.
+    params.store.append({
       profile: params.profile,
       tool: params.tool,
       command: params.command,
       description: params.description,
-      approval: yoloApproval(now),
+      approval: {
+        mode: 'yolo',
+        decision: 'allow',
+        reason: 'approval engine not yet wired (legacy direct wrapper)',
+        decided_at: now.toISOString(),
+        decided_by: 'yolo',
+      },
       exec: params.result
         ? {
             stdout: params.result.stdout ?? '',
@@ -605,13 +1458,13 @@ function auditExecution(params: {
 
 export async function executeAuditedTransportCommand(input: {
   transport: Pick<ISshTransport, 'exec' | 'execElevated'>;
-  tool: AuditTool;
+  tool: 'exec' | 'sudo-exec';
   command: string;
   description?: string;
   profile?: string;
   timeoutMs?: number;
   sudoPassword?: string;
-  store: AuditStore;
+  store: { append(record: unknown): unknown };
 }) {
   const startedAt = Date.now();
   const profile = input.profile ?? 'default';
@@ -622,9 +1475,7 @@ export async function executeAuditedTransportCommand(input: {
   let auditCommand = String(input.command ?? '');
   try {
     const sanitizedCommand = sanitizeCommand(input.command);
-    const commandWithDescription = input.description
-      ? `${sanitizedCommand} # ${input.description.replace(/#/g, '\\#')}`
-      : sanitizedCommand;
+    const commandWithDescription = appendDescriptionComment(sanitizedCommand, input.description);
     auditCommand = commandWithDescription;
     const result = input.tool === 'sudo-exec'
       ? await input.transport.execElevated(commandWithDescription, {
@@ -633,17 +1484,40 @@ export async function executeAuditedTransportCommand(input: {
           password: input.sudoPassword,
         })
       : await input.transport.exec(commandWithDescription, { timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT });
-    auditExecution({
-      tool: input.tool,
-      profile,
-      command: commandWithDescription,
-      description: input.description,
-      startedAt,
-      result,
-      store: input.store,
-    });
-    audited = true;
-    return resultToMcpContent(result);
+    // Map the result BEFORE writing the audit record: for a failed ExecResult
+    // (e.g. non-zero exit with empty stderr) `resultToMcpContent` throws the
+    // synthetic failure context ("Command exited with status N"). Auditing
+    // first would persist an empty stderr and then `audited` would suppress
+    // the catch path, leaving the wrapper's failure audits misleading and
+    // divergent from the MCP handlers (Codex 3556038517). Mirror
+    // `recordAuditResult`: audit the raw result on success, and merge the
+    // mapped execution error into stderr on failure.
+    try {
+      const response = resultToMcpContent(result);
+      auditExecution({
+        tool: input.tool,
+        profile,
+        command: commandWithDescription,
+        description: input.description,
+        startedAt,
+        result,
+        store: input.store,
+      });
+      audited = true;
+      return response;
+    } catch (mapErr) {
+      auditExecution({
+        tool: input.tool,
+        profile,
+        command: commandWithDescription,
+        description: input.description,
+        startedAt,
+        result: { ...result, stderr: stderrWithExecutionError(result.stderr, mapErr) },
+        store: input.store,
+      });
+      audited = true;
+      throw mapErr;
+    }
   } catch (err) {
     // Transport rejection (spawn failure, unexpected exception) OR a
     // sanitization rejection (empty/too-long command) still gets an audit
@@ -739,6 +1613,29 @@ export function resultToMcpContent(result: ExecResult) {
   };
 }
 
+export function isFailedExecResult(result: ExecResult): boolean {
+  return result.category === 'timeout'
+    || result.category === 'auth'
+    || result.category === 'host_key'
+    || result.category === 'connect'
+    || result.category === 'transport'
+    || (result.exitCode !== null && result.exitCode !== 0);
+}
+
+function recordAuditResult(
+  base: Omit<Parameters<AuditSink['record']>[0], 'result' | 'error'>,
+  result: ExecResult,
+) {
+  try {
+    const response = resultToMcpContent(result);
+    auditSink.record({ ...base, result });
+    return response;
+  } catch (err) {
+    auditSink.record({ ...base, result, error: err });
+    throw err;
+  }
+}
+
 const server = new McpServer({
   name: 'SSH MCP Server',
   version: '2.1.0',
@@ -757,33 +1654,60 @@ server.tool(
     connectionName: connectionNameSchema,
   },
   async ({ command, description, connectionName }) => {
-    const profile = resolvedProfileName(connectionName);
-    const startedAt = Date.now();
+    let commandWithDescription = String(command ?? '');
+    let profile = resolvedProfileName(connectionName);
+    let approvalMode = resolveLiveApprovalMode(profile, approvalEngine);
+    // Fallback timestamp for errors raised before the transport call (registry
+    // init failure, approval deny). Re-captured immediately before t.exec below
+    // so a SUCCESSFUL command's audit durationMs measures command runtime only,
+    // not SSH init + approval wait time.
+    let startedAt = Date.now();
     let audited = false;
-    // Record the raw attempted command if sanitization rejects it below. A
-    // command rejected by validation (empty / over --maxChars) still leaves an
-    // audit record — the contract covers failures, and sanitizeCommand throws.
-    let auditCommand = String(command ?? '');
+    let approvalDecision: ApprovalDecision | undefined;
     try {
       const sanitizedCommand = sanitizeCommand(command);
-      const t = await registry.get(connectionName);
-      const commandWithDescription = description
-        ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
-        : sanitizedCommand;
-      auditCommand = commandWithDescription;
+      commandWithDescription = appendDescriptionComment(sanitizedCommand, description);
+      const target = approvalTargetForConnection(registry, connectionName);
+      profile = target.profile;
+      approvalMode = resolveLiveApprovalMode(profile, approvalEngine);
+      const approved = await approveTransportForCurrentConfig({
+        reg: registry,
+        profile: target.approvalProfile,
+        gate: (currentProfile) => gateApproval({
+          profile: currentProfile,
+          tool: 'exec',
+          command: commandWithDescription,
+          description,
+        }),
+      });
+      const t = approved.transport;
+      profile = approved.profile;
+      approvalDecision = approved.approval;
+      startedAt = Date.now();
       const result = await t.exec(commandWithDescription, { timeoutMs: DEFAULT_TIMEOUT });
-      auditExecution({
+      audited = true;
+      const response = recordAuditResult({
         tool: 'exec',
         profile,
         command: commandWithDescription,
         description,
         startedAt,
-        result,
-      });
-      audited = true;
-      return resultToMcpContent(result);
+        approval: approvalDecision,
+        approvalMode,
+      }, result);
+      return response;
     } catch (err: any) {
-      if (!audited) auditExecution({ tool: 'exec', profile, command: auditCommand, description, startedAt, error: err });
+      approvalDecision = approvalDecision ?? getApprovalDecisionFromError(err);
+      if (!audited) auditSink.record({
+        tool: 'exec',
+        profile,
+        command: commandWithDescription,
+        description,
+        startedAt,
+        error: err,
+        approval: approvalDecision,
+        approvalMode,
+      });
       if (err instanceof McpError) throw err;
       throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
     }
@@ -800,43 +1724,69 @@ if (!DISABLE_SUDO) {
       connectionName: connectionNameSchema,
     },
     async ({ command, description, connectionName }) => {
-      const profile = resolvedProfileName(connectionName);
-      const startedAt = Date.now();
+      let commandWithDescription = String(command ?? '');
+      let profile = resolvedProfileName(connectionName);
+      let approvalMode = resolveLiveApprovalMode(profile, approvalEngine);
+      // Fallback timestamp for errors raised before the transport call (registry
+      // init failure, approval deny). Re-captured immediately before
+      // t.execElevated below so a SUCCESSFUL command's audit durationMs measures
+      // command runtime only, not SSH init + approval wait time.
+      let startedAt = Date.now();
       let audited = false;
-      // Record the raw attempted command if sanitization rejects it below. A
-      // command rejected by validation (empty / over --maxChars) still leaves
-      // an audit record — the contract covers failures, and sanitizeCommand
-      // throws.
-      let auditCommand = String(command ?? '');
+      let approvalDecision: ApprovalDecision | undefined;
       try {
         const sanitizedCommand = sanitizeCommand(command);
-        const t = await registry.get(connectionName);
-        const commandWithDescription = description
-          ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
-          : sanitizedCommand;
-        auditCommand = commandWithDescription;
+        commandWithDescription = appendDescriptionComment(sanitizedCommand, description);
+        const target = approvalTargetForConnection(registry, connectionName);
+        profile = target.profile;
+        approvalMode = resolveLiveApprovalMode(profile, approvalEngine);
+        const approved = await approveTransportForCurrentConfig({
+          reg: registry,
+          profile: target.approvalProfile,
+          gate: (currentProfile) => gateApproval({
+            profile: currentProfile,
+            tool: 'sudo-exec',
+            command: commandWithDescription,
+            description,
+          }),
+        });
+        const t = approved.transport;
+        profile = approved.profile;
+        approvalDecision = approved.approval;
         // Legacy single-host mode may still pass --sudoPassword on CLI; in
         // multi-host mode each ServerConfig carries its own sudoPassword.
         const legacySudo = (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined && !isMultiHost)
           ? sanitizePassword(SUDOPASSWORD)
           : undefined;
+        startedAt = Date.now();
         const result = await t.execElevated(commandWithDescription, {
           timeoutMs: DEFAULT_TIMEOUT,
           mode: 'sudo',
           password: legacySudo,
         });
-        auditExecution({
+        audited = true;
+        const response = recordAuditResult({
           tool: 'sudo-exec',
           profile,
           command: commandWithDescription,
           description,
           startedAt,
-          result,
-        });
-        audited = true;
-        return resultToMcpContent(result);
+          approval: approvalDecision,
+          approvalMode,
+        }, result);
+        return response;
       } catch (err: any) {
-        if (!audited) auditExecution({ tool: 'sudo-exec', profile, command: auditCommand, description, startedAt, error: err });
+        approvalDecision = approvalDecision ?? getApprovalDecisionFromError(err);
+        if (!audited) auditSink.record({
+          tool: 'sudo-exec',
+          profile,
+          command: commandWithDescription,
+          description,
+          startedAt,
+          error: err,
+          approval: approvalDecision,
+          approvalMode,
+        });
         if (err instanceof McpError) throw err;
         throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
       }
@@ -1022,6 +1972,22 @@ export async function execSshCommand(
 
 async function main() {
   await bootstrapRegistry();
+  // Boot the approval engine + optional audit seam BEFORE the MCP transport so
+  // the very first exec / sudo-exec call is gated and (optionally) audited.
+  await wireApprovalAndAudit();
+  // Build the config reloader AFTER the approval engine exists so a hot reload
+  // reseeds policy in lockstep with connections. CLI/`--ssh` boots participate
+  // only when paired with an explicit --config policy file.
+  configReloader = buildConfigReloader();
+  const webuiHandle = await maybeStartWebUI();
+  // Start the debounced TOML watcher LAST so the WebUI's reloadController is
+  // already subscribed before any file change can fire `config-reloaded`.
+  if (configReloader && resolvedConfig.configPath) {
+    stopConfigWatcher = startConfigWatcher({
+      configPath: resolvedConfig.configPath,
+      onChange: async () => { await configReloader!.reload(); },
+    });
+  }
   const transport = new StdioServerTransport();
   await server.connect(transport);
   const mode = isMultiHost ? `multi-host (${registry.names().length} servers: ${registry.names().join(', ')})` : 'single-host';
@@ -1029,6 +1995,8 @@ async function main() {
 
   const cleanup = () => {
     console.error('Shutting down SSH MCP Server...');
+    if (stopConfigWatcher) { try { stopConfigWatcher(); } catch { /* ignore */ } }
+    if (webuiHandle) void webuiHandle.close().catch(() => { /* ignore */ });
     void registry.closeAll();
     process.exit(0);
   };
@@ -1043,6 +2011,9 @@ if (isTestMode) {
     try {
       await bootstrapRegistry();
     } catch { /* tests may not configure hosts */ }
+    try {
+      await wireApprovalAndAudit();
+    } catch { /* tests may not configure an approval engine */ }
     const transport = new StdioServerTransport();
     server.connect(transport).catch(error => {
       console.error('Fatal error connecting server:', error);

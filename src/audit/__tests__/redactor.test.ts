@@ -120,6 +120,14 @@ describe('audit redactor', () => {
     expect(out).not.toContain('abc123');
   });
 
+  it('redacts dangling PEM private keys in command metadata', () => {
+    const begin = '-----BEGIN ' + 'OPENSSH PRIVATE KEY-----';
+    const out = redact(`ssh-add ${begin}\nraw-key-material-without-terminator`);
+    expect(out).toContain(R);
+    expect(out).not.toContain('raw-key-material');
+    expect(out).not.toContain('PRIVATE KEY');
+  });
+
   it('redacts AWS key id / secret hint and JWT shapes', () => {
     const awsKey = 'AKIA' + 'A'.repeat(16);
     const awsSecret = 'a'.repeat(40);
@@ -132,6 +140,19 @@ describe('audit redactor', () => {
     expect((out.match(/<redacted>/g) ?? []).length).toBeGreaterThanOrEqual(3);
   });
 
+  it('redacts JWTs whose claims segment is short or does not start with eyJ', () => {
+    const header = 'eyJhbGciOiJIUzI1NiJ9';
+    const signature = 's'.repeat(43);
+    const emptyObjectClaims = `${header}.e30.${signature}`;
+    const arrayClaims = `${header}.W10.${signature}`;
+
+    const out = redact(`first ${emptyObjectClaims} second ${arrayClaims}`);
+
+    expect(out).not.toContain(emptyObjectClaims);
+    expect(out).not.toContain(arrayClaims);
+    expect((out.match(/<redacted>/g) ?? []).length).toBe(2);
+  });
+
   it('redacts classic and fine-grained GitHub PATs', () => {
     const classic = 'ghp_' + 'A'.repeat(36);
     const fineGrained = 'github_pat_' + 'B'.repeat(22) + '_' + 'C'.repeat(59);
@@ -139,6 +160,16 @@ describe('audit redactor', () => {
     expect(out).not.toContain(classic);
     expect(out).not.toContain(fineGrained);
     expect((out.match(/<redacted>/g) ?? []).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('redacts bare legacy and project-scoped OpenAI API keys', () => {
+    const legacy = 'sk-' + 'A'.repeat(48);
+    const project = 'sk-proj-' + 'B'.repeat(80);
+    const out = redact(`stdout=${legacy}\nstderr=${project}`);
+
+    expect(out).not.toContain(legacy);
+    expect(out).not.toContain(project);
+    expect((out.match(/<redacted>/g) ?? []).length).toBe(2);
   });
 
   it('redacts a fine-grained PAT embedded in a remote URL', () => {
