@@ -16,10 +16,12 @@ describe('classifyError', () => {
     expect(classifyError(null, '')).toBe('transport');
   });
 
-  it('returns remote_exit for non-255 non-zero codes', () => {
-    expect(classifyError(1, 'something')).toBe('remote_exit');
-    expect(classifyError(127, 'command not found')).toBe('remote_exit');
-    expect(classifyError(254, '')).toBe('remote_exit');
+  it('treats unmatched pre-sentinel process exits as transport failures', () => {
+    // classifyError is reached only when the authenticated remote sentinel was
+    // absent. A real remote command exit is decoded from that sentinel instead.
+    expect(classifyError(1, 'something')).toBe('transport');
+    expect(classifyError(127, 'command not found')).toBe('transport');
+    expect(classifyError(254, '')).toBe('transport');
   });
 
   describe('SSH layer (exit 255) classification', () => {
@@ -42,19 +44,19 @@ describe('classifyError', () => {
       expect(classifyError(255, 'ssh: connect to host foo port 22: Connection refused')).toBe('connect');
       expect(classifyError(255, 'ssh: connect to host foo port 22: Connection timed out')).toBe('connect');
       expect(classifyError(255, 'ssh: connect to host foo port 22: Connection reset')).toBe('connect');
+      expect(classifyError(255, 'kex_exchange_identification: Connection closed by remote host')).toBe('connect');
+      expect(classifyError(255, 'Connection closed by 192.0.2.10 port 22')).toBe('connect');
       expect(classifyError(255, 'ssh: Could not resolve hostname foo')).toBe('connect');
       expect(classifyError(255, 'Name or service not known')).toBe('connect');
       expect(classifyError(255, 'No route to host')).toBe('connect');
       expect(classifyError(255, 'Network unreachable')).toBe('connect');
     });
 
-    it('falls back to remote_exit for unknown 255 stderr (ssh(1): 255 is also a valid remote command exit)', () => {
-      // When no SSH-layer signature matches, a 255 exit is surfaced as the
-      // remote command's own non-zero exit (Error (code 255)) rather than a
-      // generic SSH transport error, so legitimate remote `exit 255` is not
-      // masked. See classifyError + resultToMcpContent.
-      expect(classifyError(255, 'some unknown ssh error')).toBe('remote_exit');
-      expect(classifyError(255, '')).toBe('remote_exit');
+    it('falls back to transport when exit 255 arrived without the remote sentinel', () => {
+      // Legitimate remote `exit 255` is decoded from runSsh's sentinel before
+      // this classifier is called. Without it, no usable session was proven.
+      expect(classifyError(255, 'some unknown ssh error')).toBe('transport');
+      expect(classifyError(255, '')).toBe('transport');
     });
   });
 });

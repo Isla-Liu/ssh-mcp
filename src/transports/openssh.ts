@@ -342,6 +342,7 @@ exit 0`;
       const args = [...this.buildArgs(opts), wrappedCommand];
       let timedOut = false;
       let exited = false;
+      let settled = false;
       let stdout = '';
       let stderr = '';
 
@@ -371,10 +372,21 @@ exit 0`;
         }, 2000);
       }, opts.timeoutMs);
 
-      child.on('error', (err: Error) => {
+      const finish = (result: ExecResult) => {
+        if (settled) return;
+        settled = true;
         exited = true;
         clearTimeout(timer);
-        resolve({
+        resolve(result);
+      };
+
+      // `exit` precedes `close` while stdio is still draining. Track the real
+      // process lifecycle for timeout escalation, but wait for `close` to map
+      // the result so all stdout/stderr and the remote sentinel are available.
+      child.on('exit', () => { exited = true; });
+
+      child.on('error', (err: Error) => {
+        finish({
           stdout,
           stderr: stderr + `\nspawn error: ${err.message}`,
           exitCode: null,
@@ -383,8 +395,7 @@ exit 0`;
       });
 
       child.on('close', (code, signal) => {
-        exited = true;
-        clearTimeout(timer);
+        if (settled) return;
         const marker = `\n${endMark}`;
         const markerIdx = stdout.lastIndexOf(marker);
         const statusText = markerIdx >= 0
@@ -397,7 +408,7 @@ exit 0`;
           : remoteExit === null
             ? classifyError(code, stderr)
             : (remoteExit === 0 ? undefined : 'remote_exit');
-        resolve({
+        finish({
           stdout: commandStdout,
           stderr,
           exitCode: timedOut ? null : (remoteExit ?? code ?? null),
@@ -714,17 +725,18 @@ export function renderAskpassSshConfig(): string {
  * Map SSH exit code + stderr to structured ErrorCategory.
  *
  *   exit 0                → undefined  (success)
- *   exit 1-254            → remote_exit (remote command's own non-zero exit)
- *   exit 255              → inspect stderr for SSH-layer failure type;
- *                           falls back to remote_exit when no SSH-layer
- *                           signature matches (ssh(1) documents 255 as either
- *                           an SSH error OR the remote command's own exit 255)
+ * This classifier is called only when runSsh/runSuViaPty did NOT receive their
+ * authenticated remote sentinel. Remote command statuses (including 255) are
+ * decoded from that sentinel before this point. Therefore any unmatched local
+ * ssh-process exit is a transport failure, never a usable remote_exit.
+ *
+ *   exit non-zero         → inspect stderr for SSH-layer failure type;
+ *                           falls back to transport when no signature matches
  *   exit null             → treated as transport failure
  */
 export function classifyError(code: number | null, stderr: string): ErrorCategory | undefined {
   if (code === 0) return undefined;
   if (code === null) return 'transport';
-  if (code !== 255) return 'remote_exit';
 
   const s = stderr.toLowerCase();
   if (/permission denied/.test(s)) return 'auth';
@@ -739,11 +751,9 @@ export function classifyError(code: number | null, stderr: string): ErrorCategor
   if (/connection refused/.test(s)) return 'connect';
   if (/connection timed out/.test(s)) return 'connect';
   if (/connection reset/.test(s)) return 'connect';
+  if (/connection (?:closed|aborted)|closed by .*port|kex_exchange_identification|banner exchange/.test(s)) return 'connect';
   if (/could not resolve|name or service not known/.test(s)) return 'connect';
   if (/no route to host|network unreachable/.test(s)) return 'connect';
-  // No SSH-layer signature matched. Per ssh(1), 255 is also the exit code a
-  // remote command can legitimately return, so surface it as the remote
-  // command's own non-zero exit (Error (code 255)) rather than masking it as
-  // a generic SSH transport error.
-  return 'remote_exit';
+  // No remote sentinel means no usable remote command lifecycle was proven.
+  return 'transport';
 }
