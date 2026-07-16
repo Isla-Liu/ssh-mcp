@@ -277,7 +277,24 @@ export class TransportRegistry {
   async get(name?: string): Promise<ISshTransport> {
     const resolved = this.resolveName(name);
     const existing = this.transports.get(resolved);
-    if (existing) return existing;
+    if (existing) {
+      // ssh2 transports own a persistent socket. If that socket died, returning
+      // the cached adapter lets it reconnect with constructor-captured key
+      // material and bypasses prepareConfig, so a rotated key_path can never
+      // recover without restart. Drop only disconnected ssh2 adapters and flow
+      // through the normal lazy prepare/create/init path below. OpenSSH is
+      // intentionally excluded: it spawns per command, and isConnected=false
+      // before its first live session is normal even after successful init().
+      const disconnectedSsh2 = existing.name === 'ssh2'
+        && typeof existing.isConnected === 'function'
+        && !existing.isConnected();
+      if (!disconnectedSsh2) return existing;
+      this.transports.delete(resolved);
+      // close() is best-effort and the old adapter is already unpublished. Do
+      // not await here: this call must install initPromises synchronously enough
+      // for a concurrent get() to share the single replacement initializer.
+      void existing.close().catch(() => { /* best effort */ });
+    }
 
     // Serialize concurrent init requests for the same name
     const pending = this.initPromises.get(resolved);
