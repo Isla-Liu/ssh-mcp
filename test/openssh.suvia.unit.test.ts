@@ -164,6 +164,25 @@ describe('OpenSSH command sentinels', () => {
     expect(t.isConnected()).toBe(false);
   });
 
+  it('isolates shell syntax errors so the outer wrapper still emits a remote-exit sentinel', async () => {
+    const fc = new FakeChild();
+    spawnMock.mockReturnValue(fc);
+    const t = new OpenSshTransport({ host: 'h', port: 22, username: 'u' });
+    const pending = t.exec("printf 'unterminated", { timeoutMs: 60000 });
+
+    const args = spawnMock.mock.calls[0][1] as string[];
+    const wrapper = args.at(-1)!;
+    const { spawnSync } = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const local = spawnSync('/bin/sh', ['-c', wrapper], { encoding: 'utf8' });
+    if (local.stdout) fc.stdout.emit('data', Buffer.from(local.stdout));
+    if (local.stderr) fc.stderr.emit('data', Buffer.from(local.stderr));
+    fc.emit('exit', local.status, local.signal);
+    fc.emit('close', local.status, local.signal);
+
+    await expect(pending).resolves.toMatchObject({ exitCode: 2, category: 'remote_exit' });
+    expect(t.isConnected()).toBe(true);
+  });
+
   it.each(['error-before-close', 'close-before-error'] as const)(
     'settles a spawn-error lifecycle deterministically when events arrive %s',
     async (ordering) => {
