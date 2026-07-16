@@ -394,16 +394,24 @@ export class Ssh2Transport implements ISshTransport {
         stream.stderr.on('data', (data: Buffer) => {
           stderr += data.toString();
         });
-        stream.on('close', (code: number, _signal: string) => {
+        stream.on('close', (code: number | null, rawSignal: string) => {
           if (!isResolved) {
             isResolved = true;
             clearTimeout(timeoutId);
-            const exitCode = code ?? 0;
+            // ssh2 reports signal termination as (code=null, signal='SIG...').
+            // Coercing null to zero turns a killed remote command into success
+            // and drops the only failure diagnostic. Preserve both fields so
+            // resultToMcpContent can surface its signal-only failure branch.
+            const exitCode = typeof code === 'number' ? code : null;
+            const signal = rawSignal?.trim() || undefined;
             resolve({
               stdout,
               stderr,
               exitCode,
-              category: exitCode !== 0 ? 'remote_exit' : undefined,
+              signal,
+              category: (exitCode !== null && exitCode !== 0) || signal
+                ? 'remote_exit'
+                : undefined,
             });
           }
         });
