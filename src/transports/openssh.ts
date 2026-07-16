@@ -745,18 +745,16 @@ export function renderAskpassSshConfig(): string {
 /**
  * Map SSH exit code + stderr to structured ErrorCategory.
  *
- *   exit 0                → undefined  (success)
  * This classifier is called only when runSsh/runSuViaPty did NOT receive their
  * authenticated remote sentinel. Remote command statuses (including 255) are
  * decoded from that sentinel before this point. Therefore any unmatched local
  * ssh-process exit is a transport failure, never a usable remote_exit.
  *
- *   exit non-zero         → inspect stderr for SSH-layer failure type;
+ *   exit any code         → inspect stderr for SSH-layer failure type;
  *                           falls back to transport when no signature matches
  *   exit null             → treated as transport failure
  */
 export function classifyError(code: number | null, stderr: string): ErrorCategory | undefined {
-  if (code === 0) return undefined;
   if (code === null) return 'transport';
 
   const s = stderr.toLowerCase();

@@ -12,8 +12,8 @@ import {
 } from '../src/transports/openssh';
 
 describe('classifyError', () => {
-  it('returns undefined for success (exit 0)', () => {
-    expect(classifyError(0, '')).toBeUndefined();
+  it('treats exit 0 without the remote sentinel as a transport failure', () => {
+    expect(classifyError(0, '')).toBe('transport');
   });
 
   it('returns transport for null exit code', () => {
