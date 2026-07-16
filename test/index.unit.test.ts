@@ -1,21 +1,198 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { McpError } from '@modelcontextprotocol/sdk/types.js';
+import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   resultToMcpContent,
+  isFailedExecResult,
   resolveAuthMode,
   buildTransportConfig,
-  getOrCreateInitializedTransport,
+  hasLegacyCliFlags,
+  buildApprovalProfile,
+  approvalTargetForConnection,
+  buildProductionApprovalEngine,
+  makeApprovalModeLookup,
+  appendDescriptionComment,
+  resolveApprovalEngineInput,
+  resolveConfiguredApprovalMode,
+  resolveLiveApprovalMode,
+  preResolutionProfileName,
+  approvalResolverWarningFromInput,
+  isCliSwitchEnabled,
+  prepareKeyContents,
   validateConfig,
+  resolveCliConfigPath,
+  resolveReloadConfig,
+  shouldWatchResolvedConfig,
+  reacquireTransportIfReloaded,
+  approveTransportForCurrentConfig,
+  buildWebUIApprovalQueueAdapter,
+  validateSshCliFlag,
 } from '../src/index';
-import type { ExecResult, ISshTransport } from '../src/transports/types';
+import { ApprovalDispatcher } from '../src/approval/engine';
+import { getApprovalDecisionFromError } from '../src/approval/gate';
+import { TransportRegistry } from '../src/transports/registry';
+import type { ExecResult, ISshTransport, ServerConfig } from '../src/transports/types';
+import type { ResolvedConfig } from '../src/config/types';
 
 // Pure-function unit tests for the CLI config/result mapping layer. These
 // import from src/index, which is safe because the test runner sets
 // SSH_MCP_DISABLE_MAIN=1 (isCliEnabled=false) so no server/CLI side effects run
 // on import.
+
+function runCliStartup(args: string[], envOverrides: NodeJS.ProcessEnv): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  delete env.SSH_MCP_DISABLE_MAIN;
+  delete env.SSH_MCP_TEST;
+  for (const [key, value] of Object.entries(envOverrides)) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts', ...args], {
+      cwd: process.cwd(),
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const timeout = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error(`CLI startup did not exit within timeout. stdout=${stdout} stderr=${stderr}`));
+    }, 10000);
+
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+describe('CLI bootstrap validation order', () => {
+  it('reports incomplete legacy CLI args before loading auto-discovered TOML (Codex 3551304743)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ssh-mcp-cli-order-'));
+    const badToml = path.join(dir, 'bad.toml');
+    await fs.writeFile(badToml, '[[sources]]\nid = "broken"\npassword = "unterminated\n');
+    try {
+      const result = await runCliStartup(['--host=h'], {
+        SSH_MCP_CONFIG: badToml,
+        XDG_CONFIG_HOME: path.join(dir, 'xdg'),
+        HOME: dir,
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain('Missing required --user');
+      expect(result.stderr).not.toContain('TOML parse failed');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects bare --ssh before falling back to an auto-discovered TOML source', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ssh-mcp-cli-bare-ssh-'));
+    const validToml = path.join(dir, 'config.toml');
+    await fs.writeFile(validToml, `
+[[sources]]
+id = "toml-fallback"
+host = "toml.example"
+user = "u"
+auth = "kerberos"
+`);
+    try {
+      const result = await runCliStartup(['--ssh'], {
+        SSH_MCP_CONFIG: validToml,
+        XDG_CONFIG_HOME: path.join(dir, 'xdg'),
+        HOME: dir,
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain('--ssh requires a value (--ssh=<JSON>)');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+  it('treats --webui=false as disabled while validating TOML WebUI settings', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ssh-mcp-cli-webui-false-'));
+    const config = path.join(dir, 'config.toml');
+    await fs.writeFile(config, `
+[webui]
+enabled = false
+host = "0.0.0.0"
+auth_token = "env:WEBUI_TOKEN_MISSING"
+
+[approval]
+mode = "manual"
+
+[[sources]]
+id = "test"
+host = "test.example"
+user = "u"
+auth = "kerberos"
+`);
+    try {
+      const result = await runCliStartup([`--config=${config}`, '--webui=false'], {
+        WEBUI_TOKEN_MISSING: undefined,
+        XDG_CONFIG_HOME: path.join(dir, 'xdg'),
+        HOME: dir,
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain('manual approval mode requires WebUI to be enabled');
+      expect(result.stderr).not.toContain('WEBUI_TOKEN_MISSING');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('lets explicit --webui=false override TOML enabled=true before boot validation', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ssh-mcp-cli-webui-override-'));
+    const config = path.join(dir, 'config.toml');
+    await fs.writeFile(config, `
+[webui]
+enabled = true
+host = "0.0.0.0"
+auth_token = "env:WEBUI_TOKEN_MISSING"
+
+[approval]
+mode = "manual"
+
+[[sources]]
+id = "test"
+host = "test.example"
+user = "u"
+auth = "kerberos"
+`);
+    try {
+      const result = await runCliStartup([`--config=${config}`, '--webui=false'], {
+        WEBUI_TOKEN_MISSING: undefined,
+        XDG_CONFIG_HOME: path.join(dir, 'xdg'),
+        HOME: dir,
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain('manual approval mode requires WebUI to be enabled');
+      expect(result.stderr).not.toContain('WEBUI_TOKEN_MISSING');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('validateSshCliFlag', () => {
+  it('rejects the null marker produced by a bare --ssh', () => {
+    expect(() => validateSshCliFlag({ ssh: null }))
+      .toThrow(/--ssh requires a value/);
+  });
+
+  it('leaves absent --ssh handling to the selected legacy or TOML mode', () => {
+    expect(() => validateSshCliFlag({})).not.toThrow();
+  });
+});
 
 describe('resultToMcpContent (finding 1: exit-0 stderr must not error)', () => {
   it('treats exit 0 as success even when stderr carries an OpenSSH host-key warning', () => {
@@ -25,6 +202,9 @@ describe('resultToMcpContent (finding 1: exit-0 stderr must not error)', () => {
       exitCode: 0,
       category: undefined,
     };
+    // Must not throw (exit 0 is success). The benign OpenSSH first-connect
+    // host-key warning is filtered out of the success-path stderr, so only
+    // stdout is returned — see test/result-mapper.test.ts for the contract.
     const out = resultToMcpContent(result);
     expect(out.content[0]).toEqual({ type: 'text', text: 'ok' });
   });
@@ -117,6 +297,13 @@ describe('resultToMcpContent (finding 1: exit-0 stderr must not error)', () => {
       resultToMcpContent({ stdout: '', stderr: '', exitCode: null, category: 'timeout' }),
     ).toThrow(/timed out after \d+ms/);
   });
+
+  it('classifies mapper-throwing ExecResult values as audit failures, not successes', () => {
+    expect(isFailedExecResult({ stdout: '', stderr: '', exitCode: 0 })).toBe(false);
+    expect(isFailedExecResult({ stdout: '', stderr: '', exitCode: 1 })).toBe(true);
+    expect(isFailedExecResult({ stdout: '', stderr: '', exitCode: null, category: 'timeout' })).toBe(true);
+    expect(isFailedExecResult({ stdout: '', stderr: 'auth failed', exitCode: 0, category: 'auth' })).toBe(true);
+  });
 });
 
 describe('resolveAuthMode (finding 2: password-over-key precedence)', () => {
@@ -182,59 +369,387 @@ describe('buildTransportConfig (finding 2: no unconditional key read for passwor
     expect(cfg.keyPath).toBe('/nonexistent/path/to/key');
     expect(cfg.privateKey).toBeUndefined();
   });
+
+  it('expands a leading ~/ in the legacy --key path (Codex 3591910736 sibling, openssh)', async () => {
+    // Same keyPath ~ expansion class as the multi-host JSON path: a legacy
+    // single-host --key=~/.ssh/id must resolve to the home dir, not a literal
+    // relative "~/.ssh/id" that ssh -i / fs.readFile can't find.
+    const cfg = await buildTransportConfig({
+      host: 'h',
+      port: 22,
+      username: 'u',
+      key: '~/.ssh/id_ed25519',
+      transportFlag: 'openssh',
+    });
+    expect(cfg.transport).toBe('openssh');
+    expect(cfg.keyPath).toBe(path.join(os.homedir(), '.ssh/id_ed25519'));
+    expect(cfg.keyPath!.startsWith('~')).toBe(false);
+  });
 });
 
-describe('getOrCreateInitializedTransport (Codex P2: do not publish before init resolves)', () => {
-  function fakeTransport(): ISshTransport {
-    return {
-      name: 'openssh',
-      init: vi.fn(),
-      exec: vi.fn(),
-      execElevated: vi.fn(),
-      close: vi.fn(),
-    };
-  }
-
-  it('shares an in-flight initialization promise and publishes only after it resolves', async () => {
-    const cache = { activeTransport: null as ISshTransport | null, initPromise: null as Promise<ISshTransport> | null };
-    const transport = fakeTransport();
-    let resolveInit!: (value: ISshTransport) => void;
-    const createInitializedTransport = vi.fn(() => new Promise<ISshTransport>((resolve) => {
-      resolveInit = resolve;
-    }));
-
-    const p1 = getOrCreateInitializedTransport(cache, createInitializedTransport);
-    const p2 = getOrCreateInitializedTransport(cache, createInitializedTransport);
-
-    expect(createInitializedTransport).toHaveBeenCalledTimes(1);
-    expect(p2).toBe(p1);
-    // Critical regression guard: no half-initialized transport is visible while
-    // init is still pending, so concurrent OpenSSH/password calls cannot enter
-    // runSsh before SSH_ASKPASS exists.
-    expect(cache.activeTransport).toBeNull();
-    expect(cache.initPromise).toBe(p1);
-
-    resolveInit(transport);
-    await expect(p1).resolves.toBe(transport);
-    await expect(p2).resolves.toBe(transport);
-    expect(cache.activeTransport).toBe(transport);
-    expect(cache.initPromise).toBeNull();
+describe('approval command/context helpers', () => {
+  const resolvedConfig = (partial: Partial<ResolvedConfig> = {}): ResolvedConfig => ({
+    sources: [],
+    perSourceApproval: {},
+    defaultExplicit: false,
+    ...partial,
   });
 
-  it('clears the cached init promise after initialization failure so a retry can initialize', async () => {
-    const cache = { activeTransport: null as ISshTransport | null, initPromise: null as Promise<ISshTransport> | null };
-    const createInitializedTransport = vi
-      .fn<() => Promise<ISshTransport>>()
-      .mockRejectedValueOnce(new Error('boom'))
-      .mockResolvedValueOnce(fakeTransport());
+  it('threads per-source approval mode and source description into the approval profile', () => {
+    const profile = buildApprovalProfile(
+      'prod',
+      { prod: 'manual' },
+      { description: 'production host; maintenance window required' },
+    );
 
-    await expect(getOrCreateInitializedTransport(cache, createInitializedTransport)).rejects.toThrow('boom');
-    expect(cache.activeTransport).toBeNull();
-    expect(cache.initPromise).toBeNull();
+    expect(profile).toEqual({
+      id: 'prod',
+      description: 'production host; maintenance window required',
+      approval: { mode: 'manual' },
+    });
+  });
 
-    await expect(getOrCreateInitializedTransport(cache, createInitializedTransport)).resolves.toMatchObject({ name: 'openssh' });
-    expect(createInitializedTransport).toHaveBeenCalledTimes(2);
-    expect(cache.activeTransport?.name).toBe('openssh');
+  it('uses the live registry description when building the command approval target', () => {
+    const registry = new TransportRegistry();
+    registry.register({
+      name: 'prod',
+      host: 'prod.example.com',
+      port: 22,
+      username: 'operator',
+      transport: 'openssh',
+      authMode: 'kerberos',
+      description: 'boot policy',
+      approval: { mode: 'manual' },
+    });
+    registry.setDescription('prod', 'live edited policy');
+
+    expect(approvalTargetForConnection(registry, 'prod')).toEqual({
+      profile: 'prod',
+      approvalProfile: {
+        id: 'prod',
+        description: 'live edited policy',
+        approval: { mode: 'manual' },
+      },
+    });
+  });
+
+  it('does not leak another source approval mode into the default profile', () => {
+    const profile = buildApprovalProfile('default', { prod: 'smart' });
+    expect(profile).toEqual({ id: 'default' });
+  });
+
+  it('does not treat inherited Object.prototype members as approval overrides', () => {
+    expect(buildApprovalProfile('constructor', {})).toEqual({ id: 'constructor' });
+    expect(buildApprovalProfile('toString', {})).toEqual({ id: 'toString' });
+  });
+
+  it('WebUI approval-mode lookup ignores inherited Object.prototype keys (Codex 3568536828)', () => {
+    const engine = { defaultMode: 'smart' as const };
+    const lookup = makeApprovalModeLookup({
+      perSourceApproval: { prod: 'manual' },
+      getEngine: () => engine,
+    });
+    // Own override wins; anything else falls back to the engine default —
+    // including profiles named after Object.prototype members, which the old
+    // `perSource[name] ?? default` read as inherited functions.
+    expect(lookup('prod')).toBe('manual');
+    expect(lookup('staging')).toBe('smart');
+    expect(lookup('toString')).toBe('smart');
+    expect(lookup('constructor')).toBe('smart');
+    expect(lookup('hasOwnProperty')).toBe('smart');
+    // No engine wired -> legacy no-engine allow path is advertised as yolo.
+    const noEngine = makeApprovalModeLookup({
+      perSourceApproval: {},
+      getEngine: () => null,
+    });
+    expect(noEngine('toString')).toBe('yolo');
+  });
+
+  it('reads a profile mode mutation from the live WebUI controller on the next lookup', () => {
+    const engine = buildProductionApprovalEngine(true, resolvedConfig({
+      approval: { mode: 'yolo' },
+      perSourceApproval: { prod: 'yolo' },
+    }))!;
+    const modeController = {
+      getEffectiveMode: (profileId: string) => engine.getEffectiveMode(profileId),
+    };
+    const lookup = makeApprovalModeLookup({
+      perSourceApproval: { prod: 'yolo' },
+      getEngine: () => engine,
+      modeController,
+    });
+
+    expect(lookup('prod')).toBe('yolo');
+    engine.setProfileMode('prod', 'manual');
+    expect(lookup('prod')).toBe('manual');
+  });
+
+  it('neutralizes description newlines before appending the shell comment', () => {
+    const assembled = appendDescriptionComment('true', 'safe note\nrm -rf /tmp/should-not-run # nested');
+    expect(assembled).toMatch(/^true # /);
+    expect(assembled).toContain('rm -rf /tmp/should-not-run');
+    expect(assembled).not.toMatch(/[\r\n]/);
+  });
+
+  it('treats no [approval] and no per-source overrides as approval inactive', () => {
+    const input = resolveApprovalEngineInput(resolvedConfig());
+    expect(input).toBeNull();
+    expect(approvalResolverWarningFromInput(input, {
+      webuiEnabled: true,
+      resolverWired: false,
+    })).toBeNull();
+  });
+
+  it('uses yolo as the default only for per-source-only approval configs', () => {
+    expect(resolveApprovalEngineInput(resolvedConfig({
+      perSourceApproval: { lab: 'manual' },
+    }))?.defaultMode).toBe('yolo');
+  });
+
+  it('keeps yolo default for [approval.llm]-only configs that support per-source smart', () => {
+    expect(resolveApprovalEngineInput(resolvedConfig({
+      approval: { llm: { endpoint: 'https://api.example/v1/c', model: 'm-1', api_key: 'sk-test' } },
+      perSourceApproval: { lab: 'smart' },
+    }))?.defaultMode).toBe('yolo');
+  });
+
+  it('keeps [approval.llm]-only config inactive without a smart mode selection', () => {
+    expect(resolveApprovalEngineInput(resolvedConfig({
+      approval: { llm: { endpoint: 'https://api.example/v1/c', model: 'm-1' } },
+    }))).toBeNull();
+  });
+
+  it('builds an LLM-only WebUI engine with a yolo baseline and live smart switching', () => {
+    const engine = buildProductionApprovalEngine(true, resolvedConfig({
+      approval: {
+        llm: {
+          endpoint: 'https://api.example/v1/c',
+          model: 'm-1',
+        },
+      },
+    }));
+
+    expect(engine).not.toBeNull();
+    expect(engine!.getGlobalMode()).toBe('yolo');
+    expect(engine!.availableModes()).toContain('smart');
+    engine!.setGlobalMode('smart');
+    expect(engine!.getGlobalMode()).toBe('smart');
+  });
+
+  it('parses --webui=false as disabled while preserving the bare flag', () => {
+    expect(isCliSwitchEnabled({ webui: 'false' }, 'webui')).toBe(false);
+    expect(isCliSwitchEnabled({ webui: 'FALSE' }, 'webui')).toBe(false);
+    expect(isCliSwitchEnabled({ webui: null }, 'webui')).toBe(true);
+    expect(isCliSwitchEnabled({}, 'webui')).toBe(false);
+  });
+
+  it('preserves the documented manual default when a top-level approval option is configured', () => {
+    const input = resolveApprovalEngineInput(resolvedConfig({
+      approval: { fail_closed: true },
+      perSourceApproval: { lab: 'yolo' },
+    }));
+    expect(input?.defaultMode).toBeUndefined();
+    expect(input?.fail_closed).toBe(true);
+  });
+
+  it('redacts pending command and description text before WebUI list and enqueue exposure', async () => {
+    const engine = new ApprovalDispatcher({
+      defaultMode: 'manual',
+      manual: { webuiEnabled: true, timeout_ms: 5000 },
+    });
+    const queue = buildWebUIApprovalQueueAdapter(engine)!;
+    let enqueued: ReturnType<typeof queue.list>[number] | undefined;
+    queue.on('enqueue', pending => { enqueued = pending; });
+
+    const decision = engine.decide({
+      profile: { id: 'prod' },
+      tool: 'exec',
+      command: 'deploy --token=live-credential',
+      description: 'password another-credential',
+    });
+    await Promise.resolve();
+
+    const listed = queue.list()[0];
+    expect(listed.command).toBe('deploy --token=<redacted>');
+    expect(listed.description).toBe('password <redacted>');
+    expect(enqueued?.command).toBe(listed.command);
+    expect(enqueued?.description).toBe(listed.description);
+
+    engine.resolvePending(listed.id, 'deny', 'test cleanup', 'test');
+    await decision;
+  });
+
+  it('bounds pending command and description text before WebUI list and enqueue exposure', async () => {
+    const engine = new ApprovalDispatcher({
+      defaultMode: 'manual',
+      manual: { webuiEnabled: true, timeout_ms: 5000 },
+    });
+    const queue = buildWebUIApprovalQueueAdapter(engine)!;
+    const secret = 'ghp_' + 'S'.repeat(36);
+    const hugeCommand = `deploy --token=${secret} ${'c'.repeat(2 * 1024 * 1024)}`;
+    const hugeDescription = `password ${secret} ${'d'.repeat(2 * 1024 * 1024)}`;
+    let enqueued: ReturnType<typeof queue.list>[number] | undefined;
+    queue.on('enqueue', pending => { enqueued = pending; });
+
+    const decision = engine.decide({
+      profile: { id: 'prod' },
+      tool: 'exec',
+      command: hugeCommand,
+      description: hugeDescription,
+    });
+    await Promise.resolve();
+
+    const listed = queue.list()[0];
+    expect(Buffer.byteLength(listed.command, 'utf8')).toBeLessThanOrEqual(16 * 1024);
+    expect(Buffer.byteLength(listed.description ?? '', 'utf8')).toBeLessThanOrEqual(16 * 1024);
+    expect(listed.command).not.toContain(secret);
+    expect(listed.description).not.toContain(secret);
+    expect(enqueued).toEqual(listed);
+
+    engine.resolvePending(listed.id, 'deny', 'test cleanup', 'test');
+    await decision;
+  });
+
+  it('resolves the effective configured mode for audit failures before the gate decides', () => {
+    const config = resolvedConfig({
+      approval: { mode: 'smart' },
+      perSourceApproval: { lab: 'yolo' },
+    });
+
+    expect(resolveConfiguredApprovalMode('lab', config)).toBe('yolo');
+    expect(resolveConfiguredApprovalMode('unknown', config)).toBe('smart');
+    expect(resolveConfiguredApprovalMode('constructor', config)).toBe('smart');
+    expect(resolveConfiguredApprovalMode('legacy', resolvedConfig())).toBe('yolo');
+  });
+
+  it('resolves pre-gate audit mode from the live dispatcher after policy reload', () => {
+    const staleBootConfig = resolvedConfig({
+      approval: { mode: 'yolo' },
+      perSourceApproval: { lab: 'yolo' },
+    });
+    const engine = new ApprovalDispatcher({
+      defaultMode: 'yolo',
+      manual: { webuiEnabled: true, timeout_ms: 1000 },
+    });
+    engine.reloadPolicy({ defaultMode: 'manual', staticOverrides: { lab: 'yolo' } });
+
+    // The boot snapshot is stale after hot reload; pre-gate failures must report
+    // the same live mode that the dispatcher would enforce for a new decision.
+    expect(resolveConfiguredApprovalMode('unknown', staleBootConfig)).toBe('yolo');
+    expect(resolveLiveApprovalMode('unknown', engine)).toBe('manual');
+    expect(resolveLiveApprovalMode('lab', engine)).toBe('yolo');
+    expect(resolveLiveApprovalMode('constructor', engine)).toBe('manual');
+    expect(resolveLiveApprovalMode('legacy', null)).toBe('yolo');
+  });
+
+  it('keeps a whitespace connection name unresolved instead of attributing it to the default profile', () => {
+    expect(preResolutionProfileName('   ', 'prod', false)).toBe('   ');
+    expect(preResolutionProfileName('', 'prod', false)).toBe('prod');
+    expect(preResolutionProfileName(undefined, 'prod', true)).toBe('(unresolved)');
+  });
+});
+
+describe('hasLegacyCliFlags (finding 2: --disableSudo is not a legacy trigger)', () => {
+  it('returns false for --disableSudo alone (valid in --config / --ssh modes)', () => {
+    // --disableSudo only controls sudo-tool registration and is allowed in
+    // every mode. It must NOT force the legacy single-host validation branch
+    // (which would demand --host/--user). Regression guard for
+    // `ssh-mcp --config cfg.toml --disableSudo`.
+    expect(hasLegacyCliFlags({ disableSudo: null })).toBe(false);
+  });
+
+  it('still returns true for a genuine legacy flag like --host', () => {
+    expect(hasLegacyCliFlags({ host: 'h' })).toBe(true);
+  });
+
+  it('still returns true for --port (single-host-only flag)', () => {
+    expect(hasLegacyCliFlags({ port: '2222' })).toBe(true);
+  });
+
+  it('returns false for an empty / config-only argv', () => {
+    expect(hasLegacyCliFlags({})).toBe(false);
+    expect(hasLegacyCliFlags({ config: '/etc/ssh-mcp/config.toml' })).toBe(false);
+  });
+});
+
+describe('buildTransportConfig (Codex 3541767256: deferKeyRead keeps legacy key reads lazy)', () => {
+  it('does NOT read the ssh2 key file at build time when deferKeyRead is set', async () => {
+    // The legacy single-host bootstrap passes deferKeyRead so startup never
+    // reads the key file — a key mounted after process launch must still work,
+    // matching the pre-registry behavior (read on first tool call, not startup).
+    const cfg = await buildTransportConfig(
+      { host: 'h', port: 22, username: 'u', key: '/nonexistent/path/to/key' },
+      { deferKeyRead: true },
+    );
+    expect(cfg.transport).toBe('ssh2');
+    expect(cfg.authMode).toBe('key');
+    // keyPath is recorded so the registry's lazy prepareKeyContents can read it
+    // on first use, but the (nonexistent) file must NOT be read now.
+    expect(cfg.keyPath).toBe('/nonexistent/path/to/key');
+    expect(cfg.privateKey).toBeUndefined();
+  });
+
+  it('still reads the ssh2 key eagerly when deferKeyRead is not set (default)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ssh-mcp-test-'));
+    const keyPath = path.join(dir, 'id_test');
+    await fs.writeFile(keyPath, 'KEYDATA');
+    try {
+      const cfg = await buildTransportConfig({ host: 'h', port: 22, username: 'u', key: keyPath });
+      expect(cfg.privateKey).toBe('KEYDATA');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('prepareKeyContents (Codex 3549295046: skip deferred key reads when password auth wins)', () => {
+  it('does NOT read a stale keyPath when the resolved authMode is password', async () => {
+    // The registry hook must mirror buildTransportConfig()'s eager-read guard:
+    // a `--password=... --key=/stale` config records keyPath but authMode is
+    // 'password', so the first tool call must use the password, not ENOENT on
+    // the stale/nonexistent key file.
+    const cfg: ServerConfig = {
+      name: 'n',
+      host: 'h',
+      port: 22,
+      username: 'u',
+      authMode: 'password',
+      transport: 'ssh2',
+      password: 'pw',
+      keyPath: '/nonexistent/path/to/stale-key',
+    };
+    await prepareKeyContents(cfg);
+    expect(cfg.privateKey).toBeUndefined();
+    expect(cfg.password).toBe('pw');
+  });
+
+  it('reads the ssh2 keyPath when the resolved authMode is key', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ssh-mcp-test-'));
+    const keyPath = path.join(dir, 'id_test');
+    await fs.writeFile(keyPath, 'KEYDATA');
+    try {
+      const cfg: ServerConfig = {
+        name: 'n', host: 'h', port: 22, username: 'u',
+        authMode: 'key', transport: 'ssh2', keyPath,
+      };
+      await prepareKeyContents(cfg);
+      expect(cfg.privateKey).toBe('KEYDATA');
+      expect(cfg.privateKeyDerivedFromKeyPath).toBe(true);
+      await fs.writeFile(keyPath, 'ROTATED');
+      await prepareKeyContents(cfg);
+      expect(cfg.privateKey).toBe('ROTATED');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not read the key for an openssh key config (uses -i path instead)', async () => {
+    const cfg: ServerConfig = {
+      name: 'n', host: 'h', port: 22, username: 'u',
+      authMode: 'key', transport: 'openssh', keyPath: '/nonexistent/path/to/key',
+    };
+    await prepareKeyContents(cfg);
+    expect(cfg.privateKey).toBeUndefined();
   });
 });
 
@@ -308,3 +823,463 @@ describe('validateConfig (Codex P2: reject value-less OpenSSH option flags)', ()
     ).not.toThrow();
   });
 });
+
+describe('resolveCliConfigPath (Codex R2 P2: reject value-less --config)', () => {
+  it('returns undefined when --config is absent', () => {
+    expect(resolveCliConfigPath({})).toBeUndefined();
+    expect(resolveCliConfigPath({ host: 'h', user: 'u' })).toBeUndefined();
+  });
+
+  it('returns the path for --config=<path>', () => {
+    expect(resolveCliConfigPath({ config: '/etc/ssh-mcp/config.toml' }))
+      .toBe('/etc/ssh-mcp/config.toml');
+  });
+
+  it('expands a leading home marker for --config=~/... (Codex 3549260475)', () => {
+    expect(resolveCliConfigPath({ config: '~/ssh-mcp/config.toml' }))
+      .toBe(path.join(os.homedir(), 'ssh-mcp/config.toml'));
+  });
+
+  it('rejects a present-but-value-less --config (parsed as null) instead of silently ignoring it', () => {
+    // parseArgv records `null` for `--config` with no `=path`. Coercing that to
+    // undefined would fall back to SSH_MCP_CONFIG/default discovery, so a
+    // mistyped explicit flag could start against the wrong configured source.
+    expect(() => resolveCliConfigPath({ config: null }))
+      .toThrow(/--config requires a value/);
+  });
+
+  it('rejects an empty --config= (parsed as "") the same as a value-less --config (Codex 3541772406)', () => {
+    // `--config=` parses as an empty string; resolveConfig treats it as the
+    // explicit path but skips loadTomlFile because it is falsy, silently
+    // dropping the intended TOML settings. Fail fast instead.
+    expect(() => resolveCliConfigPath({ config: '' }))
+      .toThrow(/--config requires a value/);
+  });
+});
+
+describe('reload config resolution', () => {
+  it('watches an explicit --config when CLI sources win, but not an auto-discovered file', () => {
+    expect(shouldWatchResolvedConfig({
+      configPath: '/etc/ssh-mcp/explicit.toml',
+      cliSourceCount: 2,
+      explicitConfigPath: '/etc/ssh-mcp/explicit.toml',
+    })).toBe(true);
+
+    expect(shouldWatchResolvedConfig({
+      configPath: '/etc/ssh-mcp/legacy-policy.toml',
+      cliSourceCount: 1,
+      explicitConfigPath: '/etc/ssh-mcp/legacy-policy.toml',
+    })).toBe(true);
+
+    expect(shouldWatchResolvedConfig({
+      configPath: '/home/operator/.ssh-mcp/config.toml',
+      cliSourceCount: 2,
+      explicitConfigPath: undefined,
+    })).toBe(false);
+
+    expect(shouldWatchResolvedConfig({
+      configPath: undefined,
+      cliSourceCount: 2,
+      explicitConfigPath: '/etc/ssh-mcp/explicit.toml',
+    })).toBe(false);
+  });
+
+  it('reloads explicit TOML top-level policy while preserving CLI sources', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ssh-mcp-reload-cli-'));
+    const configPath = path.join(dir, 'config.toml');
+    const cliSources: ServerConfig[] = [
+      {
+        name: 'cli-a', host: 'a.example.com', port: 22, username: 'operator',
+        authMode: 'kerberos', transport: 'openssh', kerberos: true,
+      },
+      {
+        name: 'cli-b', host: 'b.example.com', port: 22, username: 'operator',
+        authMode: 'kerberos', transport: 'openssh', kerberos: true,
+      },
+    ];
+    try {
+      await fs.writeFile(configPath, `
+[server]
+require_connection = false
+
+[approval]
+mode = "manual"
+
+[[sources]]
+id = "suppressed"
+password = "env:UNSET_SOURCE_PASSWORD"
+`);
+      const first = resolveReloadConfig({
+        cliSources,
+        configPath,
+        cliArgs: { config: configPath },
+        env: {},
+      });
+      expect(first.sources.map(source => source.name)).toEqual(['cli-a', 'cli-b']);
+      expect(first.requireConnection).toBe(false);
+      expect(first.approval?.mode).toBe('manual');
+
+      await fs.writeFile(configPath, `
+[server]
+require_connection = true
+
+[approval]
+mode = "yolo"
+`);
+      const second = resolveReloadConfig({
+        cliSources,
+        configPath,
+        cliArgs: { config: configPath },
+        env: {},
+      });
+      expect(second.sources.map(source => source.name)).toEqual(['cli-a', 'cli-b']);
+      expect(second.requireConnection).toBe(true);
+      expect(second.approval?.mode).toBe('yolo');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves explicit --webui=false while validating a reload', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ssh-mcp-reload-webui-'));
+    const configPath = path.join(dir, 'config.toml');
+    await fs.writeFile(configPath, `
+[webui]
+enabled = false
+host = "0.0.0.0"
+
+[[sources]]
+id = "prod"
+host = "prod.example.com"
+user = "operator"
+auth = "kerberos"
+`);
+    try {
+      expect(() => resolveReloadConfig({
+        cliSources: [],
+        configPath,
+        cliArgs: { webui: null },
+        env: {},
+      })).toThrow(/auth_token/);
+
+      expect(resolveReloadConfig({
+        cliSources: [],
+        configPath,
+        cliArgs: { webui: 'false' },
+        env: {},
+      }).webui?.enabled).toBe(false);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('reacquireTransportIfReloaded (Codex R4 finding 4: revalidate after awaited approval)', () => {
+  const stub = (name = 'ssh2'): ISshTransport => ({
+    name,
+    init: async () => {},
+    exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) as ExecResult,
+    execElevated: async () => ({ stdout: '', stderr: '', exitCode: 0 }) as ExecResult,
+    close: async () => {},
+  } as unknown as ISshTransport);
+
+  function fakeRegistry(opts: {
+    genBefore: number;
+    genAfter: number;
+    profileId: string;
+    getTransport?: ISshTransport;
+    getThrows?: Error;
+  }) {
+    // First getReloadGeneration() call (the capture) returns genBefore; the
+    // check inside the helper sees genAfter, emulating a reload during approval.
+    let firstRead = true;
+    const reg = {
+      getReloadGeneration: () => {
+        if (firstRead) { firstRead = false; return opts.genBefore; }
+        return opts.genAfter;
+      },
+      get: async (_name?: string) => {
+        if (opts.getThrows) throw opts.getThrows;
+        return opts.getTransport!;
+      },
+      profile: (_name?: string) => ({ id: opts.profileId } as any),
+    };
+    return reg;
+  }
+
+  it('returns the ORIGINAL transport unchanged when no reload landed during approval', async () => {
+    const original = stub('original');
+    const reg = {
+      getReloadGeneration: () => 5, // same before and after — no reload
+      get: async () => { throw new Error('get() must NOT be called when no reload'); },
+      profile: (_n?: string) => ({ id: 'alpha' } as any),
+    };
+    const captured = reg.getReloadGeneration();
+    const { transport, profile } = await reacquireTransportIfReloaded(
+      reg as any, 'alpha', original, captured,
+    );
+    expect(transport).toBe(original);
+    expect(profile).toBe('alpha');
+  });
+
+  it('RE-ACQUIRES a fresh transport when a reload bumped the generation during approval', async () => {
+    const original = stub('pre-reload');
+    const fresh = stub('post-reload');
+    const reg = fakeRegistry({ genBefore: 1, genAfter: 2, profileId: 'alpha', getTransport: fresh });
+    const captured = reg.getReloadGeneration(); // 1
+    const { transport, profile } = await reacquireTransportIfReloaded(
+      reg as any, 'alpha', original, captured,
+    );
+    // The stale pre-reload transport is discarded for the freshly re-dialed one.
+    expect(transport).toBe(fresh);
+    expect(transport).not.toBe(original);
+    expect(profile).toBe('alpha');
+  });
+
+  it('propagates a clean error when the source was REMOVED by the reload (get() throws)', async () => {
+    const original = stub('pre-reload');
+    const reg = fakeRegistry({
+      genBefore: 1,
+      genAfter: 2,
+      profileId: 'gone',
+      getThrows: new Error('Unknown connection name: gone. Registered: beta'),
+    });
+    const captured = reg.getReloadGeneration();
+    await expect(
+      reacquireTransportIfReloaded(reg as any, 'gone', original, captured),
+    ).rejects.toThrow(/Unknown connection name: gone/);
+  });
+});
+
+describe('approveTransportForCurrentConfig (Codex V4 finding: re-run approval after reload)', () => {
+  const stub = (name = 'ssh2'): ISshTransport => ({
+    name,
+    init: async () => {},
+    exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) as ExecResult,
+    execElevated: async () => ({ stdout: '', stderr: '', exitCode: 0 }) as ExecResult,
+    close: async () => {},
+  } as unknown as ISshTransport);
+
+  const allow = (reason: string) => ({
+    decision: 'allow' as const,
+    reason,
+    decided_by: 'test',
+    decided_at: new Date(0).toISOString(),
+    mode: 'manual' as const,
+  });
+
+  it('reruns approval against the CURRENT profile after a reload invalidates the first decision', async () => {
+    let generation = 1;
+    const fresh = stub('post-reload');
+    const approvedProfiles: string[] = [];
+    const reg = {
+      getReloadGeneration: () => generation,
+      get: async (_name?: string) => fresh,
+      profile: (_name?: string) => ({ id: generation === 1 ? 'old-profile' : 'new-profile' } as any),
+    };
+
+    const result = await approveTransportForCurrentConfig({
+      reg: reg as any,
+      profile: reg.profile('alpha') as any,
+      gate: async (profile) => {
+        approvedProfiles.push(profile.id);
+        if (approvedProfiles.length === 1) {
+          // Simulate the config reload landing while the first manual/smart
+          // approval was in flight. That stale approval MUST NOT authorize the
+          // post-reload transport/profile.
+          generation = 2;
+          return allow('stale decision');
+        }
+        return allow('current decision');
+      },
+    });
+
+    expect(approvedProfiles).toEqual(['old-profile', 'new-profile']);
+    expect(result.transport).toBe(fresh);
+    expect(result.profile).toBe('new-profile');
+    expect(result.approval.reason).toBe('current decision');
+  });
+
+  it('keeps an omitted request pinned to the sampled profile after reload', async () => {
+    let generation = 1;
+    const fresh = stub('post-reload');
+    const approvedProfiles: string[] = [];
+    const getNames: Array<string | undefined> = [];
+    const reg = {
+      getReloadGeneration: () => generation,
+      get: async (name?: string) => { getNames.push(name); return fresh; },
+      profile: (name?: string) => ({
+        id: name === 'old-default' || generation === 1 ? 'old-default' : 'new-default',
+      } as any),
+    };
+
+    const result = await approveTransportForCurrentConfig({
+      reg: reg as any,
+      profile: reg.profile(undefined) as any,
+      gate: async (profile) => {
+        approvedProfiles.push(profile.id);
+        if (approvedProfiles.length === 1) generation = 2;
+        return allow(approvedProfiles.length === 1 ? 'stale decision' : 'current decision');
+      },
+    });
+
+    expect(getNames).toEqual(['old-default']);
+    expect(approvedProfiles).toEqual(['old-default', 'old-default']);
+    expect(result.profile).toBe('old-default');
+    expect(result.transport).toBe(fresh);
+  });
+
+  it('acquires the transport only after approval is current', async () => {
+    const fresh = stub('post-approval');
+    const order: string[] = [];
+    const reg = {
+      getReloadGeneration: () => 1,
+      get: async (name?: string) => { order.push(`get:${name}`); return fresh; },
+      profile: (name?: string) => ({ id: name ?? 'alpha' } as any),
+    };
+
+    const result = await approveTransportForCurrentConfig({
+      reg: reg as any,
+      profile: reg.profile('alpha') as any,
+      gate: async (profile) => {
+        order.push(`gate:${profile.id}`);
+        return allow('current decision');
+      },
+    });
+
+    expect(order).toEqual(['gate:alpha', 'get:alpha']);
+    expect(result.transport).toBe(fresh);
+    expect(result.profile).toBe('alpha');
+  });
+
+  it('re-approves when a reload lands while transport initialization is pending', async () => {
+    let generation = 1;
+    let getCalls = 0;
+    const fresh = stub('post-reload');
+    const order: string[] = [];
+    const reg = {
+      getReloadGeneration: () => generation,
+      get: async (name?: string) => {
+        getCalls += 1;
+        order.push(`get${getCalls}:${name}`);
+        if (getCalls === 1) generation = 2;
+        return fresh;
+      },
+      profile: (name?: string) => ({ id: name ?? 'alpha' } as any),
+    };
+
+    const result = await approveTransportForCurrentConfig({
+      reg: reg as any,
+      profile: reg.profile('alpha') as any,
+      gate: async (profile) => {
+        order.push(`gate${generation}:${profile.id}`);
+        return allow(`decision-${generation}`);
+      },
+    });
+
+    expect(order).toEqual(['gate1:alpha', 'get1:alpha', 'gate2:alpha', 'get2:alpha']);
+    expect(result.transport).toBe(fresh);
+    expect(result.approval.reason).toBe('decision-2');
+  });
+
+  it('retries against the CURRENT profile when a stale pre-reload denial throws', async () => {
+    let generation = 1;
+    const fresh = stub('post-reload');
+    const approvedProfiles: string[] = [];
+    const reg = {
+      getReloadGeneration: () => generation,
+      get: async (_name?: string) => fresh,
+      profile: (_name?: string) => ({ id: generation === 1 ? 'old-profile' : 'new-profile' } as any),
+    };
+
+    const result = await approveTransportForCurrentConfig({
+      reg: reg as any,
+      profile: reg.profile('alpha') as any,
+      gate: async (profile) => {
+        approvedProfiles.push(profile.id);
+        if (approvedProfiles.length === 1) {
+          generation = 2;
+          throw new Error('approval denied by stale profile');
+        }
+        return allow('current decision');
+      },
+    });
+
+    expect(approvedProfiles).toEqual(['old-profile', 'new-profile']);
+    expect(result.transport).toBe(fresh);
+    expect(result.profile).toBe('new-profile');
+    expect(result.approval.reason).toBe('current decision');
+  });
+
+  it('preserves a real denial when no reload changed the generation', async () => {
+    const reg = {
+      getReloadGeneration: () => 1,
+      get: async () => { throw new Error('get() must NOT be called for a current denial'); },
+      profile: (_name?: string) => ({ id: 'current-profile' } as any),
+    };
+
+    await expect(approveTransportForCurrentConfig({
+      reg: reg as any,
+      profile: reg.profile('alpha') as any,
+      gate: async () => { throw new Error('approval denied by current profile'); },
+    })).rejects.toThrow(/current profile/);
+  });
+
+  it('carries the approval on the error when transport acquisition fails after an allow', async () => {
+    // Codex finding 3575258575: approval succeeded but registry.get() rejected
+    // (unreadable lazy key, connect failure, source removed post-approval).
+    // The operator's decision must survive on the thrown error so the tool
+    // handlers' catch path audits the REAL decision via
+    // getApprovalDecisionFromError instead of a synthetic approval:not-run.
+    const reg = {
+      getReloadGeneration: () => 1,
+      get: async () => { throw new Error('connect ECONNREFUSED 192.0.2.1:22'); },
+      profile: (_name?: string) => ({ id: 'alpha' } as any),
+    };
+    const decision = allow('operator allowed before transport failure');
+
+    let caught: unknown;
+    try {
+      await approveTransportForCurrentConfig({
+        reg: reg as any,
+        profile: reg.profile('alpha') as any,
+        gate: async () => decision,
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/ECONNREFUSED/);
+    // Exactly the shape both tool handlers recover in their catch blocks.
+    expect(getApprovalDecisionFromError(caught)).toBe(decision);
+  });
+
+  it('does not overwrite an approval already attached to the acquisition error', async () => {
+    // A registry.get() failure may itself carry an approval (e.g. a nested
+    // gate); the outer helper must not clobber that inner truth.
+    const inner = allow('inner pre-attached decision');
+    const failure = Object.assign(new Error('acquisition failed with prior decision'), {
+      approval: inner,
+    });
+    const reg = {
+      getReloadGeneration: () => 1,
+      get: async () => { throw failure; },
+      profile: (_name?: string) => ({ id: 'alpha' } as any),
+    };
+
+    let caught: unknown;
+    try {
+      await approveTransportForCurrentConfig({
+        reg: reg as any,
+        profile: reg.profile('alpha') as any,
+        gate: async () => allow('outer decision'),
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(getApprovalDecisionFromError(caught)).toBe(inner);
+  });
+});
+
