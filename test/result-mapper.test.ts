@@ -1,6 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { McpError } from '@modelcontextprotocol/sdk/types.js';
 import { isFailedExecResult, resultToMcpContent } from '../src/index';
+import { Ssh2Transport } from '../src/transports/ssh2';
 import type { ExecResult } from '../src/transports/types';
 
 // Regression: previously any non-empty stderr threw "Error (code 0):" even when
@@ -149,5 +151,41 @@ describe('resultToMcpContent', () => {
       exitCode: 255,
       category: 'auth',
     })).toThrow(/SSH authentication error/);
+  });
+});
+
+describe('Ssh2Transport signal exit propagation', () => {
+  it('preserves a signal-only channel close as a failed remote exit', async () => {
+    class FakeStream extends EventEmitter {
+      stderr = new EventEmitter();
+      write = vi.fn();
+      end = vi.fn();
+    }
+
+    const stream = new FakeStream();
+    const exec = vi.fn((_command: string, callback: (err: Error | undefined, stream: FakeStream) => void) => {
+      callback(undefined, stream);
+    });
+    const transport = new Ssh2Transport({ host: 'h', port: 22, username: 'u' });
+    (transport as any).manager = {
+      ensureConnected: vi.fn().mockResolvedValue(undefined),
+      getSuPassword: vi.fn().mockReturnValue(undefined),
+      getConnection: vi.fn().mockReturnValue({ exec }),
+      getSuShell: vi.fn().mockReturnValue(null),
+    };
+
+    const pending = transport.exec('kill -TERM $$', { timeoutMs: 60000 });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    stream.emit('close', null, 'SIGTERM');
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      stdout: '',
+      stderr: '',
+      exitCode: null,
+      signal: 'SIGTERM',
+      category: 'remote_exit',
+    });
+    expect(() => resultToMcpContent(result)).toThrow(/Error \(signal SIGTERM\):/);
   });
 });
