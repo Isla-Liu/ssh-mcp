@@ -132,7 +132,20 @@ export function parseServerConfigJson(raw: string): ServerConfig {
   // Reject a non-integer / out-of-range port at parse time.
   let port = 22;
   if (obj.port !== undefined) {
-    const p = typeof obj.port === 'number' ? obj.port : Number(obj.port);
+    // Accept ONLY a real number or a numeric string. Blind Number() coercion of
+    // any other JSON type is unsafe: Number(true) === 1, Number([22]) === 22,
+    // and Number(null) === 0 would let a boolean / single-element array / null
+    // masquerade as a port. Restrict the coercible types up front (mirrors the
+    // TOML loader's number-only rule) so only a genuine numeric value reaches
+    // the range check below.
+    let p: number;
+    if (typeof obj.port === 'number') {
+      p = obj.port;
+    } else if (typeof obj.port === 'string' && obj.port.trim() !== '') {
+      p = Number(obj.port);
+    } else {
+      p = NaN;
+    }
     if (!Number.isInteger(p) || p < 1 || p > 65535) {
       throw new Error(`--ssh "${obj.name}" invalid "port": ${JSON.stringify(obj.port)} (expected integer 1-65535)`);
     }
@@ -185,7 +198,12 @@ export function parseServerConfigJson(raw: string): ServerConfig {
       if (cfg.transport === 'openssh' && obj.privateKey) {
         throw new Error(`--ssh "${obj.name}" inline "privateKey" is not supported for transport "openssh"; use "keyPath"`);
       }
-      if (obj.keyPath) cfg.keyPath = obj.keyPath;
+      // Expand a leading `~`/`~/` to the user's home dir — the same class the
+      // TOML loader handles via expandHome. `ssh -i` (openssh) and fs.readFile
+      // (ssh2) both take the path verbatim and do NOT shell-expand `~`, so a
+      // stored literal `~/.ssh/id` resolves to a bogus relative path and auth
+      // fails. Validation above already guaranteed a non-empty string.
+      if (obj.keyPath) cfg.keyPath = expandHome(obj.keyPath);
       if (obj.privateKey) cfg.privateKey = obj.privateKey;
       // Require actual key material. Without keyPath (openssh -i / ssh2 read)
       // or an inline privateKey (ssh2), buildArgs() omits `-i` and
@@ -447,8 +465,10 @@ function buildLegacyServerConfig(): ServerConfig | undefined {
   // Only attach the key path when key auth actually wins. Attaching a stale
   // --key on a password/kerberos source would make prepareKeyContents (ssh2)
   // read the possibly-nonexistent file, and openssh's password/kerberos
-  // branches never use keyPath anyway.
-  if (KEY && authMode === 'key') cfg.keyPath = KEY;
+  // branches never use keyPath anyway. Expand a leading `~`/`~/` here too so the
+  // registry's lazy prepareKeyContents read (ssh2) and `ssh -i` (openssh) get a
+  // real path — same keyPath ~ class as parseServerConfigJson/buildTransportConfig.
+  if (KEY && authMode === 'key') cfg.keyPath = expandHome(KEY);
   if (SUPASSWORD !== null && SUPASSWORD !== undefined) cfg.suPassword = sanitizePassword(SUPASSWORD);
   if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) cfg.sudoPassword = sanitizePassword(SUDOPASSWORD);
   if (KERBEROS_FLAG) cfg.kerberos = true;
@@ -608,7 +628,12 @@ export async function buildTransportConfig(
 
   if (inputs.password) cfg.password = inputs.password;
   if (inputs.key) {
-    cfg.keyPath = inputs.key;
+    // Expand a leading `~`/`~/` before storing or reading. Neither `ssh -i`
+    // (openssh) nor fs.readFile (ssh2) shell-expands `~`, so the expanded path
+    // must be what we persist AND what the eager ssh2 read below opens — same
+    // keyPath ~ class as parseServerConfigJson / the TOML loader.
+    const expandedKey = expandHome(inputs.key)!;
+    cfg.keyPath = expandedKey;
     // ssh2 transport needs the key contents, not the path — but only when the
     // key is the resolved auth mode. A password config that also carries a
     // stale/sample --key must NOT read the (possibly nonexistent) key file,
@@ -621,7 +646,7 @@ export async function buildTransportConfig(
     // still honored — startup must not read the key file (Codex 3541767256).
     if (transport === 'ssh2' && authMode === 'key' && !opts.deferKeyRead) {
       const fs = await import('fs/promises');
-      cfg.privateKey = await fs.readFile(inputs.key, 'utf8');
+      cfg.privateKey = await fs.readFile(expandedKey, 'utf8');
     }
   }
   if (inputs.suPassword !== null && inputs.suPassword !== undefined) cfg.suPassword = sanitizePassword(inputs.suPassword);
