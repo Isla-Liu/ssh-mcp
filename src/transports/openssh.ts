@@ -32,6 +32,27 @@ export class OpenSshTransport implements ISshTransport {
   private askpassEnvName?: string;
   private askpassConfigPath?: string;
   private cleanupRegistered = false;
+  /**
+   * Process-level cleanup handlers registered in {@link init}. Retained so
+   * {@link close} can UNREGISTER them: init() adds `process.once` listeners for
+   * exit/SIGINT/SIGTERM, and without removing them on close a config hot-reload
+   * (which closes + discards every transport, then re-dials on next use) would
+   * accumulate one dead handler set per reload — each pinning a closed
+   * transport in memory. Undefined until init() registers them.
+   */
+  private cleanupHandlers?: {
+    exit: () => void;
+    sigint: () => void;
+    sigterm: () => void;
+  };
+  /**
+   * True when the most recent command completed a usable live SSH session (an
+   * exec whose failure, if any, was the remote command's own non-zero exit).
+   * OpenSSH has no persistent connection — init() only verifies the local ssh
+   * binary — so list-servers must reflect the latest session attempt rather
+   * than retain historical success after a later auth/transport failure.
+   */
+  private lastSessionUsable = false;
 
   constructor(private cfg: TransportConfig) {}
 
@@ -47,9 +68,14 @@ export class OpenSshTransport implements ISshTransport {
 
     if (!this.cleanupRegistered) {
       const cleanup = () => { void this.close(); };
-      process.once('exit', cleanup);
-      process.once('SIGINT', () => { cleanup(); process.exit(130); });
-      process.once('SIGTERM', () => { cleanup(); process.exit(143); });
+      // Keep stable references so close() can remove exactly these listeners.
+      const onExit = cleanup;
+      const onSigint = () => { cleanup(); process.exit(130); };
+      const onSigterm = () => { cleanup(); process.exit(143); };
+      process.once('exit', onExit);
+      process.once('SIGINT', onSigint);
+      process.once('SIGTERM', onSigterm);
+      this.cleanupHandlers = { exit: onExit, sigint: onSigint, sigterm: onSigterm };
       this.cleanupRegistered = true;
     }
   }
@@ -57,10 +83,42 @@ export class OpenSshTransport implements ISshTransport {
   async exec(command: string, opts: ExecOptions): Promise<ExecResult> {
     // If suPassword is configured, route through PTY-su state machine to
     // preserve the implicit-su behaviour that ssh2 transport has.
-    if (this.cfg.suPassword) {
-      return this.runSuViaPty(command, this.cfg.suPassword, opts);
+    const result = this.cfg.suPassword
+      ? await this.runSuViaPty(command, this.cfg.suPassword, opts)
+      : await this.runSsh(command, opts);
+    this.recordLiveness(result);
+    return result;
+  }
+
+  /**
+   * Update lastSessionUsable from a completed exec result. Only a usable remote
+   * session — success or a remote command's own non-zero exit — proves this
+   * OpenSSH transport can run commands. Authentication and host-key rejections
+   * may reach the server, but they do not establish a usable session and should
+   * not make list-servers report the server as connected.
+   */
+  private recordLiveness(result: ExecResult): void {
+    if (
+      result.category === 'auth' ||
+      result.category === 'host_key' ||
+      result.category === 'connect' ||
+      result.category === 'transport' ||
+      result.category === 'timeout'
+    ) {
+      this.lastSessionUsable = false;
+      return;
     }
-    return this.runSsh(command, opts);
+    this.lastSessionUsable = true;
+  }
+
+  /**
+   * OpenSSH has no persistent connection; report a live connection only when the
+   * most recent command completed a usable session (see lastSessionUsable). This
+   * keeps list-servers from advertising a merely-initialized transport as
+   * connected or retaining stale success after a later connection failure.
+   */
+  isConnected(): boolean {
+    return this.lastSessionUsable;
   }
 
   async execElevated(command: string, opts: ExecElevatedOptions): Promise<ExecResult> {
@@ -75,7 +133,9 @@ export class OpenSshTransport implements ISshTransport {
       // no sudo password is available but a su password is, run the command as
       // root via su to preserve equivalent behaviour.
       if (pwd === undefined && this.cfg.suPassword) {
-        return this.runSuViaPty(command, this.cfg.suPassword, opts);
+        const r = await this.runSuViaPty(command, this.cfg.suPassword, opts);
+        this.recordLiveness(r);
+        return r;
       }
       if (pwd !== undefined) {
         // OpenSSH receives the remote command as a local ssh argv element.
@@ -83,16 +143,21 @@ export class OpenSshTransport implements ISshTransport {
         // exposes it to local process inspection. Keep argv password-free and
         // feed sudo -S via stdin instead.
         const wrapped = buildOpenSshSudoWrapper(command, true);
-        return this.runSsh(wrapped, {
+        const r = await this.runSsh(wrapped, {
           ...opts,
           stdin: `${pwd}\n${opts.stdin ?? ''}`,
         });
+        this.recordLiveness(r);
+        return r;
       }
       const wrapped = buildOpenSshSudoWrapper(command, false);
-      return this.runSsh(wrapped, opts);
+      const r = await this.runSsh(wrapped, opts);
+      this.recordLiveness(r);
+      return r;
     }
     const suPwd = opts.password ?? this.cfg.suPassword;
     if (!suPwd) {
+      // Config error — no command runs, so this does not prove host liveness.
       return {
         stdout: '',
         stderr: 'su elevation requires --suPassword',
@@ -100,10 +165,27 @@ export class OpenSshTransport implements ISshTransport {
         category: 'auth',
       };
     }
-    return this.runSuViaPty(command, suPwd, opts);
+    const r = await this.runSuViaPty(command, suPwd, opts);
+    this.recordLiveness(r);
+    return r;
   }
 
   async close(): Promise<void> {
+    // Unregister the process-level cleanup listeners added in init(). On a
+    // config hot-reload the registry closes and DISCARDS this transport, then
+    // re-dials a fresh one on next use; leaving the old exit/SIGINT/SIGTERM
+    // handlers attached would leak one dead listener set (and the closed
+    // transport they close over) per reload, eventually tripping Node's
+    // MaxListenersExceededWarning. Removing them here is a no-op during real
+    // process teardown (a fired `process.once` listener has already removed
+    // itself), so this is safe on both the reload path and the exit path.
+    if (this.cleanupHandlers) {
+      process.removeListener('exit', this.cleanupHandlers.exit);
+      process.removeListener('SIGINT', this.cleanupHandlers.sigint);
+      process.removeListener('SIGTERM', this.cleanupHandlers.sigterm);
+      this.cleanupHandlers = undefined;
+      this.cleanupRegistered = false;
+    }
     if (this.askpassDir) {
       try {
         // Synchronous removal: close() is invoked from process 'exit'/SIGINT/
