@@ -1565,10 +1565,10 @@ export async function executeAuditedTransportCommand(input: {
  * Map ExecResult to MCP tool response. Preserves upstream semantics:
  *   - auth/host_key/connect/transport categories → reject with descriptive error
  *   - timeout → reject with timeout error
- *   - non-zero exit → reject (wraps as "Error (code N):\n<stderr>"), even when
- *     stderr is empty (e.g. `false`, `test -f missing`): the synthetic detail
- *     "Command exited with status N" is used so a failed command never looks
- *     like a success just because it printed nothing to stderr.
+ *   - non-zero exit/signal → reject with synthetic status/signal context first;
+ *     benign OpenSSH warnings are removed, then substantive stderr wins over a
+ *     stdout fallback. Whitespace/warning-only stderr therefore cannot make a
+ *     failed command look context-free.
  *   - exit 0 → success, even if stderr is non-empty
  *
  * Exit 0 is treated as success regardless of stderr: the OpenSSH transport
@@ -1619,9 +1619,18 @@ export function resultToMcpContent(result: ExecResult) {
   if (result.category === 'transport') {
     throw new McpError(ErrorCode.InternalError, result.stderr || 'SSH transport error');
   }
-  if (result.exitCode !== null && result.exitCode !== 0) {
-    const detail = result.stderr || `Command exited with status ${result.exitCode}`;
-    throw new McpError(ErrorCode.InternalError, `Error (code ${result.exitCode}):\n${detail}`);
+  const failedExit = result.exitCode !== null && result.exitCode !== 0;
+  const signal = result.signal?.trim() || undefined;
+  if (failedExit || signal) {
+    const status = failedExit
+      ? `Command exited with status ${result.exitCode}${signal ? ` (signal ${signal})` : ''}`
+      : `Command terminated by signal ${signal}`;
+    const filteredStderr = stripBenignSshWarnings(result.stderr);
+    const stdoutFallback = result.stdout.trim();
+    const diagnostic = filteredStderr || stdoutFallback;
+    const detail = diagnostic ? `${status}\n${diagnostic}` : status;
+    const label = failedExit ? `code ${result.exitCode}` : `signal ${signal}`;
+    throw new McpError(ErrorCode.InternalError, `Error (${label}):\n${detail}`);
   }
   const diagnostics = stripBenignSshWarnings(result.stderr);
   const text = diagnostics
@@ -1641,7 +1650,8 @@ export function isFailedExecResult(result: ExecResult): boolean {
     || result.category === 'host_key'
     || result.category === 'connect'
     || result.category === 'transport'
-    || (result.exitCode !== null && result.exitCode !== 0);
+    || (result.exitCode !== null && result.exitCode !== 0)
+    || Boolean(result.signal?.trim());
 }
 
 function recordAuditResult(
