@@ -19,6 +19,7 @@
 - [Features](#features)
 - [Installation](#installation)
 - [Client Setup](#client-setup)
+- [TOML config watch / hot reload](#toml-config-watch--hot-reload)
 - [Testing](#testing)
 - [Disclaimer](#disclaimer)
 - [Support](#support)
@@ -35,6 +36,7 @@
 - MCP-compliant server exposing SSH capabilities
 - Execute shell commands on remote Linux and Windows systems
 - Secure authentication via password or SSH key
+- **Kerberos / GSSAPI single-sign-on** via the OpenSSH subprocess transport — opt-in; see [Kerberos / OpenSSH Transport](#kerberos--openssh-transport)
 - Built with TypeScript and the official MCP SDK
 - **Configurable timeout protection** with automatic process abortion
 - **Graceful timeout handling** - attempts to kill hanging processes before closing connections
@@ -45,12 +47,14 @@
   - **Parameters:**
     - `command` (required): Shell command to execute on the remote SSH server
     - `description` (optional): Optional description of what this command will do (appended as a comment)
+    - `connectionName` (required when multiple connections are configured; optional for a single source): the source id/name to target. Omitting it with more than one connection registered fails fast and lists the valid names; it does not silently route to a default.
   - **Timeout Configuration:**
 
 - `sudo-exec`: Execute a shell command with sudo elevation
   - **Parameters:**
     - `command` (required): Shell command to execute as root using sudo
     - `description` (optional): Optional description of what this command will do (appended as a comment)
+    - `connectionName` (required when multiple connections are configured; optional for a single source): the source id/name to target. Same fail-fast rule as `exec`.
   - **Notes:**
     - Requires `--sudoPassword` to be set for password-protected sudo
     - Can be disabled by passing the `--disableSudo` flag at startup if sudo access is not needed or not available
@@ -94,6 +98,11 @@ You can configure your IDE or LLM like Cursor, Windsurf, Claude Desktop to use t
 - `timeout`: Command execution timeout in milliseconds (default: 60000ms = 1 minute)
 - `maxChars`: Maximum allowed characters for the `command` input (default: 1000). Use `none` or `0` to disable the limit.
 - `disableSudo`: Flag to disable the `sudo-exec` tool completely. Useful when sudo access is not needed or not available.
+- `transport`: Transport implementation. `ssh2` (default, unchanged) or `openssh` (spawns the system `ssh` binary — needed for Kerberos). See [Kerberos / OpenSSH Transport](#kerberos--openssh-transport).
+- `kerberos`: Flag shorthand for `--transport=openssh` with `GSSAPIAuthentication=yes`. Requires an active Kerberos ticket (TGT) on the client.
+- `gssapiDelegateCredentials`: `yes` or `no` (default `no`). Forwards the client TGT to the remote host for second-hop SSO. Use only against trusted hosts.
+- `knownHostsFile`: Path to a pinned `known_hosts` file (openssh transport only).
+- `strictHostKeyChecking`: `yes`, `no`, or `accept-new` (default `accept-new`; openssh transport only).
 
 
 ```commandline
@@ -178,6 +187,131 @@ After adding the server, restart Claude Code and ask Cascade to execute a comman
 ```
 
 For more information about MCP in Claude Code, see the [official documentation](https://docs.claude.com/en/docs/claude-code/mcp).
+
+## Kerberos / OpenSSH Transport
+
+> Experimental. Backwards-compatible: unchanged when `--transport` and `--kerberos` are both omitted.
+
+> **POSIX target shell required.** The OpenSSH subprocess transport wraps each
+> command with POSIX `sh` syntax to preserve the remote exit status reliably.
+> It therefore supports Linux/Unix targets whose SSH login shell is
+> POSIX-compatible, including a Windows OpenSSH *client* connecting to Linux.
+> A Windows OpenSSH server whose login shell is PowerShell or `cmd.exe` is not a
+> supported target for this transport; use the default `ssh2` transport for
+> Windows targets instead.
+
+The default `ssh2`-based transport does not implement GSSAPI/Kerberos authentication (upstream issue [mscdex/ssh2#333](https://github.com/mscdex/ssh2/issues/333), open since 2015). When an **opt-in** OpenSSH subprocess transport is selected, the server delegates SSH to the operating system's `ssh` binary, which supports:
+
+- Kerberos SSO via GSSAPI (`-o GSSAPIAuthentication=yes`)
+- Public-key auth (`-i <key>`)
+- Password auth (via `SSH_ASKPASS`; not recommended — prefer Kerberos or keys)
+
+### When to use it
+
+- Windows client (domain-joined) → Linux target (AD-joined via SSSD/realmd, `sshd_config: GSSAPIAuthentication yes`): the user's logon TGT is consumed automatically by Win32-OpenSSH via SSPI. **No password. No key file.**
+- Any environment where a Kerberos KDC issues tickets and SSH is preferred over re-entering credentials.
+
+### Prerequisites
+
+1. The `ssh` binary must be on `PATH` (Windows: enabled by default since Windows 10 1803; Linux: `apt install openssh-client`).
+2. The **remote** `sshd_config` must have `GSSAPIAuthentication yes`.
+3. The user must have a valid TGT:
+   - **Windows (AD-joined):** automatic on login. Verify with `klist`.
+   - **Linux (MIT Kerberos):** run `kinit <user@REALM>` or use `k5start` with a keytab for service accounts.
+4. For an AD-integrated Linux target, SSSD/realmd must be joined to the domain.
+
+### Example — Claude Code / any MCP client
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp": {
+      "command": "npx",
+      "args": [
+        "-y", "ssh-mcp", "--",
+        "--host=ubuntu-dev.example.internal",
+        "--user=aduser@EXAMPLE.INTERNAL",
+        "--kerberos"
+      ]
+    }
+  }
+}
+```
+
+Equivalent expanded form:
+
+```bash
+npx -y ssh-mcp -- \
+  --transport=openssh \
+  --kerberos \
+  --host=ubuntu-dev.example.internal \
+  --user=aduser@EXAMPLE.INTERNAL \
+  --strictHostKeyChecking=accept-new
+```
+
+> `--kerberos` is what selects Kerberos/GSSAPI auth (it sets
+> `-o GSSAPIAuthentication=yes` and implies `--transport=openssh`). Passing
+> only `--transport=openssh` selects the OpenSSH transport but leaves auth in
+> its default mode — it does **not** enable GSSAPI on its own, so keep
+> `--kerberos` here for the example to be equivalent to the compact form above.
+
+### CLI flags added by this mode
+
+| Flag | Values | Default | Notes |
+|---|---|---|---|
+| `--transport` | `ssh2` / `openssh` | `ssh2` | Selects implementation |
+| `--kerberos` | flag | off | Implies `--transport=openssh` |
+| `--gssapiDelegateCredentials` | `yes` / `no` | `no` | Forward TGT (trusted hosts only) |
+| `--knownHostsFile` | path | `~/.ssh/known_hosts` | `openssh` only |
+| `--strictHostKeyChecking` | `yes` / `no` / `accept-new` | `accept-new` | `openssh` only |
+
+### Caveats and limitations
+
+- **POSIX remote login shell only.** `--transport=openssh` uses a POSIX
+  subshell/sentinel protocol for command status and its sudo/su flows also
+  require standard Unix utilities. PowerShell and `cmd.exe` target shells are
+  explicitly remain outside this transport's supported contract rather than
+  being treated as compatible. Windows remains supported as the local
+  OpenSSH/Kerberos client, and as a remote target through the default `ssh2`
+  transport.
+- **No connection multiplexing on Windows.** Win32-OpenSSH does not support `ControlMaster` ([issue #1328](https://github.com/PowerShell/Win32-OpenSSH/issues/1328)). Each `exec` call spawns a fresh `ssh.exe` and performs a full Kerberos AP-REQ round trip. Expect ~100–300 ms extra latency per invocation on Windows. Linux/macOS may work around this with user-provided `ssh_config` `ControlMaster` settings — the transport does not configure multiplexing itself.
+- **Password mode via `SSH_ASKPASS`.** When `--password` is combined with `--transport=openssh`, the server writes a short-lived askpass helper to `%TEMP%/ssh-mcp-<pid>/` and exports the password through a per-process environment variable. The password never appears in `argv` but is briefly visible to same-user-session process inspection. Prefer Kerberos or key auth.
+- **`--suPassword` over OpenSSH transport** is implemented via `ssh -tt` with a local expect-style state machine (random-nonce sentinel prompts). Works, but has more moving parts than the ssh2 path. Report issues with stderr output if you hit a regression.
+- **Delegation (`GSSAPIDelegateCredentials=yes`)** is off by default. Enabling it forwards your TGT to the remote host, which can then impersonate you elsewhere — use only against fully trusted infrastructure. See Microsoft's guidance on Kerberos delegation.
+
+## TOML config watch / hot reload
+
+When the server is started from a TOML config file (`--config=<path>`, `$SSH_MCP_CONFIG`, or a discovered `~/.config/ssh-mcp/config.toml` / `~/.ssh-mcp/config.toml`), it **watches that file and hot-reloads on change** — no restart needed. Edit the file, save, and within ~500ms the running server picks up the new configuration. CLI/`--ssh=<JSON>` boots are not file-backed by themselves, but when they are paired with an explicit `--config=<path>`, that file is watched for top-level `[server]`, `[webui]`, and `[approval]` changes while the CLI connection set remains authoritative.
+
+### What reloads (and what does not)
+
+| Reloaded live | NOT reloaded |
+|---|---|
+| The set of named connections (`[[sources]]`) and their parameters | The **MCP tool list** (`exec` / `sudo-exec` / `list-servers`) |
+| Per-source `description` | The WebUI bind host/port/auth token |
+| Approval policy: `[approval].mode` + per-source `[sources.approval].mode` | The audit-log destination |
+
+A reload re-establishes the **file** as the source of truth: any live in-memory overrides made through the WebUI (an edited description, a switched approval mode) are dropped in favour of the freshly-loaded file values. All reload mutation is in-memory — the server **never writes the config file back**, so an edit can't feedback-loop with the watcher.
+
+### Safety: validate-before-swap with rollback
+
+A bad edit can't take the server down. The reload is transactional:
+
+1. **Parse + validate** the new file. If it fails to parse or validate, the server logs the error and **keeps every existing connection and the current approval policy** untouched.
+2. **Swap** connections + approval policy atomically. If any step fails — e.g. the new policy selects an approval mode whose engine wasn't armed at boot, or a smart reload edits `[approval.llm]` (see below) — the server **rolls both layers back together** to the last known-good state. Note that ssh2 key files are read **lazily**, on first use of a source, not at reload time (mirroring boot): a TOML edit with a bad ssh2 `key_path` is therefore *applied* at reload and surfaces only when that source is next selected — it is **not** rolled back at reload. This deliberately isolates one host's bad key from edits to unrelated healthy sources.
+3. **Broadcast** a `config-reloaded` SSE event so every open WebUI dashboard re-fetches and converges on the new server truth.
+
+A successful reload closes **only** the transports of sources that were removed or whose connection parameters changed; sources whose connection params are unchanged keep their live persistent connection, so editing a description or approval mode never interrupts an in-flight command on an untouched host.
+
+Multiple rapid saves (editors often fire several change events per save) are **debounced** into a single reload (~500ms window), and a change arriving while a reload is in flight is coalesced into exactly one trailing reload.
+
+### STDIO transport caveat
+
+> Hot reload refreshes connections, descriptions, and approval policy — it does **not** add or remove MCP tools. ssh-mcp's tool set (`exec` / `sudo-exec` / `list-servers`) is static and registered once at startup, so a STDIO client never needs to reconnect to keep working. The WebUI receives the `config-reloaded` SSE event and updates live; STDIO MCP clients see the new connection set the next time they call `list-servers` or target a connection by name. (This mirrors dbhub's documented STDIO limitation, where the tool list *is* config-derived; here it isn't, so the caveat is narrower.)
+
+> **Switching INTO a newly-configured `smart` or `manual` mode needs a restart.** The approval sub-engines (yolo / smart / manual) are built once at boot from the engines that are *armed* then — e.g. `smart` is only armed when `[approval.llm]` was present at startup. A hot reload can freely switch *among already-armed* modes, but a reload that newly introduces `[approval.llm]` (or first enables the WebUI for `manual`) is rejected and rolled back; restart the server to arm the new engine. The same applies when the server booted with **no `[approval]` policy at all and the WebUI disabled** (no engine is wired, so the gate is `legacy:no-engine` allow): a reload that introduces any enforcing policy — a global or per-source mode other than `yolo` — is rejected and rolled back rather than reported as applied while commands keep running unenforced. Restart to arm the engine.
+
+> **Editing `[approval.llm]` while `smart` is active also needs a restart.** Because the `smart` sub-engine (its LLM endpoint / model / api_key / timeout / provider / fail_closed) is captured once at boot and never rebuilt on reload, a reload that *changes* any of those `[approval.llm]` fields while `smart` remains the effective mode is **rejected and rolled back** — otherwise the reload would report success while approvals kept hitting the stale boot-time endpoint (silently ignoring a rotated key or a new model). Restart the server to pick up an `[approval.llm]` change.
 
 ## Testing
 

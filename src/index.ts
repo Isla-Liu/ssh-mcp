@@ -1,12 +1,61 @@
 #!/usr/bin/env node
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { Client, ClientChannel } from 'ssh2';
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
-// Example usage: node build/index.js --host=1.2.3.4 --port=22 --user=root --password=pass --key=path/to/key --timeout=5000 --disableSudo
+import { ISshTransport, TransportConfig, ServerConfig, ExecResult, AuthMode } from './transports/types.js';
+import { SSHConnectionManager, SSHConfig } from './transports/ssh2.js';
+import { createTransport } from './transports/factory.js';
+import { TransportRegistry } from './transports/registry.js';
+import { resolveConfig } from './config/resolver.js';
+import { expandHome } from './config/toml-loader.js';
+import type { ResolvedConfig, ApprovalMode } from './config/types.js';
+import { resolveApprovalEngineInput as resolveApprovalEngineInputForConfig } from './config/approval-policy.js';
+import { startConfigWatcher } from './config/config-watcher.js';
+import { ConfigReloader } from './config/reloader.js';
+import {
+  sanitizeCommand as sanitizeCommandImpl,
+  sanitizePassword,
+  escapeCommandForShell,
+} from './utils/shell.js';
+import {
+  gateApproval,
+  getApprovalDecisionFromError,
+  setApprovalEngine,
+  buildApprovalEngineFromConfig,
+  manualWithoutResolverWarning,
+  type ApprovalDecision,
+  type BuildEngineFromConfigInput,
+  type ApprovalDispatcher,
+  type ResolvedSource,
+} from './approval/index.js';
+import { loadAuditSink, stderrWithExecutionError, type AuditSink } from './approval/audit-seam.js';
+import { AUDIT_COMMAND_MIN_CAP_BYTES, capThenRedact } from './audit/store.js';
+import { startWebUI } from './webui/server.js';
+import type {
+  ManualApprovalQueue,
+  PendingApproval as WebUIPendingApproval,
+  ApprovalDecision as WebUIApprovalDecision,
+  AuditTail as WebUIAuditTail,
+  ModeController as WebUIModeController,
+  SourceController as WebUISourceController,
+  SourceUpdatedEvent as WebUISourceUpdatedEvent,
+  ConfigReloadController as WebUIConfigReloadController,
+} from './webui/types.js';
+
+// Re-exports for backward compatibility with existing tests.
+export { SSHConnectionManager, escapeCommandForShell };
+export type { SSHConfig };
+
+// =============================================================================
+// CLI parsing — two modes:
+//   (A) Multi-host: repeated --ssh=<JSON> (each JSON must include "name")
+//   (B) Legacy single-host: --host --user [--kerberos | --key | --password] ...
+// =============================================================================
+
 function parseArgv() {
   const args = process.argv.slice(2);
   const config: Record<string, string | null> = {};
@@ -14,20 +63,230 @@ function parseArgv() {
     if (arg.startsWith('--')) {
       const equalIndex = arg.indexOf('=');
       if (equalIndex === -1) {
-        // Flag without value
         config[arg.slice(2)] = null;
       } else {
-        // Key=value pair
-        config[arg.slice(2, equalIndex)] = arg.slice(equalIndex + 1);
+        const key = arg.slice(2, equalIndex);
+        // --ssh is handled separately below (repeatable); skip here so we
+        // don't clobber with only the last value.
+        if (key === 'ssh') continue;
+        config[key] = arg.slice(equalIndex + 1);
       }
     }
   }
   return config;
 }
+
+function collectSshJsonArgs(): string[] {
+  return process.argv.slice(2)
+    .filter(a => a.startsWith('--ssh='))
+    .map(a => a.slice('--ssh='.length));
+}
+
+/**
+ * Resolve and validate the transport for a multi-host --ssh JSON config.
+ * Defaults to 'ssh2'; rejects any value that is not exactly 'ssh2' or 'openssh'
+ * so a typo like "opnssh" fails at parse time instead of silently running the
+ * default ssh2 transport. (createTransport treats any non-'openssh' value as
+ * ssh2, while prepareKeyContents only loads a key when transport === 'ssh2',
+ * so an unchecked typo would connect over ssh2 without the configured key.)
+ * Mirrors the legacy CLI's `Invalid --transport` rejection.
+ */
+function resolveJsonTransport(obj: any): 'ssh2' | 'openssh' {
+  const t = obj.transport ?? 'ssh2';
+  if (t !== 'ssh2' && t !== 'openssh') {
+    throw new Error(`--ssh "${obj.name}" invalid "transport": ${JSON.stringify(obj.transport)} (expected "ssh2" or "openssh")`);
+  }
+  return t;
+}
+
+export function parseServerConfigJson(raw: string): ServerConfig {
+  let obj: any;
+  try {
+    obj = JSON.parse(raw);
+  } catch (e: any) {
+    // Do NOT echo the raw argument: a malformed --ssh config can still carry a
+    // password or private key alongside the syntax error, and main() prints the
+    // thrown error to stderr. Surface only the parser message, never the config.
+    throw new Error(`--ssh JSON parse error: ${e?.message || e}`);
+  }
+  // name must be a non-empty string: a numeric key (e.g. `"name": 1`) registers
+  // under a Map key the MCP tools' string connectionName can never resolve.
+  if (typeof obj.name !== 'string' || obj.name.length === 0) {
+    throw new Error('--ssh JSON requires a non-empty string "name"');
+  }
+  if (typeof obj.host !== 'string' || obj.host.length === 0) {
+    throw new Error(`--ssh "${obj.name}" missing required "host" (expected a non-empty string)`);
+  }
+  const user = obj.user ?? obj.username;
+  if (typeof user !== 'string' || user.length === 0) {
+    throw new Error(`--ssh "${obj.name}" missing required "user" (or "username") (expected a non-empty string)`);
+  }
+  const auth: AuthMode | undefined = obj.auth;
+  if (!auth || !['kerberos', 'key', 'password'].includes(auth)) {
+    throw new Error(`--ssh "${obj.name}" requires "auth": "kerberos" | "key" | "password"`);
+  }
+
+  // port: mirror the legacy --port numeric validation. An unchecked value fails
+  // only at first use (openssh `ssh -G -p abc` -> "Bad port", exit 255; ssh2
+  // receives a non-numeric port), advertised by list-servers as if healthy.
+  // Reject a non-integer / out-of-range port at parse time.
+  let port = 22;
+  if (obj.port !== undefined) {
+    // Accept ONLY a real number or a numeric string. Blind Number() coercion of
+    // any other JSON type is unsafe: Number(true) === 1, Number([22]) === 22,
+    // and Number(null) === 0 would let a boolean / single-element array / null
+    // masquerade as a port. Restrict the coercible types up front (mirrors the
+    // TOML loader's number-only rule) so only a genuine numeric value reaches
+    // the range check below.
+    let p: number;
+    if (typeof obj.port === 'number') {
+      p = obj.port;
+    } else if (typeof obj.port === 'string' && obj.port.trim() !== '') {
+      p = Number(obj.port);
+    } else {
+      p = NaN;
+    }
+    if (!Number.isInteger(p) || p < 1 || p > 65535) {
+      throw new Error(`--ssh "${obj.name}" invalid "port": ${JSON.stringify(obj.port)} (expected integer 1-65535)`);
+    }
+    port = p;
+  }
+
+  const cfg: ServerConfig = {
+    name: obj.name,
+    host: obj.host,
+    port,
+    username: user,
+    authMode: auth,
+  };
+  if (typeof obj.description === 'string') cfg.description = obj.description;
+
+  switch (auth) {
+    case 'kerberos':
+      cfg.kerberos = true;
+      cfg.transport = 'openssh';
+      // Kerberos implies openssh; reject an explicit conflicting transport
+      // rather than silently overriding it (mirrors the legacy --kerberos rule).
+      if (obj.transport !== undefined && obj.transport !== 'openssh') {
+        throw new Error(`--ssh "${obj.name}" auth "kerberos" implies transport "openssh" (got ${JSON.stringify(obj.transport)})`);
+      }
+      break;
+    case 'key':
+      cfg.transport = resolveJsonTransport(obj);
+      // The legacy single-host CLI used `--key=<path>`; the multi-host JSON
+      // schema uses `keyPath` (openssh -i / ssh2 read from disk) or
+      // `privateKey` (ssh2 inline contents). A legacy-shaped top-level `key`
+      // field is read by neither transport, so a config that supplies only
+      // `key` has NO key material and would silently fall back to ambient
+      // agent/default identities. Reject it with guidance instead of accepting
+      // a credential-less key config (Codex 3541767246).
+      if (obj.key !== undefined) {
+        throw new Error(`--ssh "${obj.name}" auth "key" uses "keyPath" (or "privateKey" for ssh2), not "key"`);
+      }
+      if (obj.keyPath !== undefined &&
+          (typeof obj.keyPath !== 'string' || obj.keyPath.length === 0)) {
+        throw new Error(`--ssh "${obj.name}" "keyPath" must be a non-empty string`);
+      }
+      if (obj.privateKey !== undefined &&
+          (typeof obj.privateKey !== 'string' || obj.privateKey.length === 0)) {
+        throw new Error(`--ssh "${obj.name}" "privateKey" must be a non-empty string`);
+      }
+      // OpenSshTransport.buildArgs only passes cfg.keyPath via `-i`; an inline
+      // privateKey would be silently ignored and ssh would fall back to
+      // agent/default identities. Reject the combination so the configured
+      // credential is actually used (or the user switches to keyPath).
+      if (cfg.transport === 'openssh' && obj.privateKey) {
+        throw new Error(`--ssh "${obj.name}" inline "privateKey" is not supported for transport "openssh"; use "keyPath"`);
+      }
+      // Expand a leading `~`/`~/` to the user's home dir — the same class the
+      // TOML loader handles via expandHome. `ssh -i` (openssh) and fs.readFile
+      // (ssh2) both take the path verbatim and do NOT shell-expand `~`, so a
+      // stored literal `~/.ssh/id` resolves to a bogus relative path and auth
+      // fails. Validation above already guaranteed a non-empty string.
+      if (obj.keyPath) cfg.keyPath = expandHome(obj.keyPath);
+      if (obj.privateKey) cfg.privateKey = obj.privateKey;
+      // Require actual key material. Without keyPath (openssh -i / ssh2 read)
+      // or an inline privateKey (ssh2), buildArgs() omits `-i` and
+      // `IdentitiesOnly=yes`, and the ssh2 transport has no key, so the
+      // connection silently falls back to whatever default or agent identity is
+      // offered instead of the intended key. Fail at parse time rather than
+      // let a key-auth config connect with an ambient identity (Codex 3541767246).
+      if (!cfg.keyPath && !cfg.privateKey) {
+        throw new Error(
+          `--ssh "${obj.name}" auth "key" requires "keyPath"${cfg.transport === 'ssh2' ? ' or inline "privateKey"' : ''}`,
+        );
+      }
+      break;
+    case 'password':
+      cfg.transport = resolveJsonTransport(obj);
+      // Require actual password material. An empty/missing password still
+      // registers the server as password-authenticated but fails on first use:
+      // OpenSshTransport.init() throws "authMode=password requires --password",
+      // and the default ssh2 path attempts to connect without the credential the
+      // selected auth mode promises. Fail at parse time like the key-auth branch
+      // already does for missing key material (Codex 3549295040).
+      if (typeof obj.password !== 'string' || obj.password.length === 0) {
+        throw new Error(`--ssh "${obj.name}" auth "password" requires a non-empty "password"`);
+      }
+      cfg.password = obj.password;
+      break;
+  }
+
+  for (const field of ['sudoPassword', 'suPassword'] as const) {
+    if (obj[field] !== undefined && typeof obj[field] !== 'string') {
+      throw new Error(`--ssh "${obj.name}" "${field}" must be a string`);
+    }
+    if (obj[field]) cfg[field] = obj[field];
+  }
+
+  // gssapiDelegateCredentials: enum-validate and require kerberos auth (the only
+  // path that emits GSSAPIDelegateCredentials). An unchecked typo like "maybe"
+  // registers but fails every command (openssh `ssh -G -o
+  // GSSAPIDelegateCredentials=maybe` -> "unsupported option", exit 255).
+  // Mirrors the legacy rules "must be yes or no" + "requires --kerberos".
+  if (obj.gssapiDelegateCredentials !== undefined) {
+    if (!['yes', 'no'].includes(obj.gssapiDelegateCredentials)) {
+      throw new Error(`--ssh "${obj.name}" gssapiDelegateCredentials must be "yes" or "no" (got ${JSON.stringify(obj.gssapiDelegateCredentials)})`);
+    }
+    if (auth !== 'kerberos') {
+      throw new Error(`--ssh "${obj.name}" gssapiDelegateCredentials requires auth "kerberos"`);
+    }
+    cfg.gssapiDelegateCredentials = obj.gssapiDelegateCredentials;
+  }
+
+  // strictHostKeyChecking: enum-validate. An unchecked value fails every command
+  // (openssh `ssh -G -o StrictHostKeyChecking=maybe` -> "unsupported option",
+  // exit 255). Mirrors the legacy enum check.
+  if (obj.strictHostKeyChecking !== undefined &&
+      !['yes', 'no', 'accept-new'].includes(obj.strictHostKeyChecking)) {
+    throw new Error(`--ssh "${obj.name}" strictHostKeyChecking must be one of: yes, no, accept-new (got ${JSON.stringify(obj.strictHostKeyChecking)})`);
+  }
+
+  // knownHostsFile / strictHostKeyChecking are openssh-transport-only. The ssh2
+  // transport ignores both, so accepting them on an ssh2 config would silently
+  // drop the requested host-key enforcement — a security downgrade. Mirror the
+  // legacy single-host rule ("--knownHostsFile and --strictHostKeyChecking
+  // require --transport=openssh") and reject the combination here.
+  if (obj.knownHostsFile !== undefined &&
+      (typeof obj.knownHostsFile !== 'string' || obj.knownHostsFile.length === 0)) {
+    throw new Error(`--ssh "${obj.name}" "knownHostsFile" must be a non-empty string`);
+  }
+  if ((obj.knownHostsFile !== undefined || obj.strictHostKeyChecking !== undefined) && cfg.transport !== 'openssh') {
+    throw new Error(
+      `--ssh "${obj.name}" knownHostsFile/strictHostKeyChecking require "transport": "openssh" (got ${cfg.transport})`
+    );
+  }
+  if (obj.knownHostsFile) cfg.knownHostsFile = obj.knownHostsFile;
+  if (obj.strictHostKeyChecking) cfg.strictHostKeyChecking = obj.strictHostKeyChecking;
+  return cfg;
+}
+
 const isTestMode = process.env.SSH_MCP_TEST === '1';
 const isCliEnabled = process.env.SSH_MCP_DISABLE_MAIN !== '1';
 const argvConfig = (isCliEnabled || isTestMode) ? parseArgv() : {} as Record<string, string>;
+const sshJsonArgs = (isCliEnabled || isTestMode) ? collectSshJsonArgs() : [];
 
+// Legacy (single-host) flags
 const HOST = argvConfig.host;
 const PORT = argvConfig.port ? parseInt(argvConfig.port) : 22;
 const USER = argvConfig.user;
@@ -36,13 +295,7 @@ const SUPASSWORD = argvConfig.suPassword;
 const SUDOPASSWORD = argvConfig.sudoPassword;
 const DISABLE_SUDO = argvConfig.disableSudo !== undefined;
 const KEY = argvConfig.key;
-const DEFAULT_TIMEOUT = argvConfig.timeout ? parseInt(argvConfig.timeout) : 60000; // 60 seconds default timeout
-// Max characters configuration:
-// - Default: 1000 characters
-// - When set via --maxChars:
-//   * a positive integer enforces that limit
-//   * 0 or a negative value disables the limit (no max)
-//   * the string "none" (case-insensitive) disables the limit (no max)
+const DEFAULT_TIMEOUT = argvConfig.timeout ? parseInt(argvConfig.timeout) : 60000;
 const MAX_CHARS_RAW = argvConfig.maxChars;
 const MAX_CHARS = (() => {
   if (typeof MAX_CHARS_RAW === 'string') {
@@ -56,439 +309,1522 @@ const MAX_CHARS = (() => {
   return 1000;
 })();
 
-function validateConfig(config: Record<string, string | null>) {
-  const errors = [];
-  if (!config.host) errors.push('Missing required --host');
-  if (!config.user) errors.push('Missing required --user');
-  if (config.port && isNaN(Number(config.port))) errors.push('Invalid --port');
+const TRANSPORT_FLAG = argvConfig.transport;
+const KERBEROS_FLAG = argvConfig.kerberos !== undefined && argvConfig.kerberos !== 'false';
+const GSSAPI_DELEGATE = argvConfig.gssapiDelegateCredentials;
+const KNOWN_HOSTS_FILE = argvConfig.knownHostsFile;
+const STRICT_HOST_KEY = argvConfig.strictHostKeyChecking;
+// The explicit `--config` path is resolved (and value-less `--config` rejected)
+// once below, then reused by both boot resolution and hot-reload eligibility.
+
+// Flags that signal intent to use the legacy single-host CLI mode. NOTE:
+// `disableSudo` is deliberately excluded — it only controls whether the sudo
+// tool is registered and is valid across ALL modes (multi-host --ssh and TOML
+// --config included). Treating it as a legacy trigger made
+// `--config cfg.toml --disableSudo` route through validateConfig(false) and
+// wrongly demand --host/--user. `port` stays here because it is only
+// meaningful as part of a single-host source.
+const legacyFlagNames = [
+  'host', 'user', 'password', 'key', 'kerberos', 'transport',
+  'strictHostKeyChecking', 'knownHostsFile', 'gssapiDelegateCredentials',
+  'suPassword', 'sudoPassword', 'port',
+] as const;
+
+export function hasLegacyCliFlags(config: Record<string, string | null>): boolean {
+  return legacyFlagNames.some(f => config[f] !== undefined);
+}
+
+/**
+ * Reject a present-but-value-less --ssh before TOML discovery can provide a
+ * lower-precedence source. parseArgv records bare `--ssh` (including the first
+ * half of a space-separated `--ssh JSON` invocation) as null, while valid
+ * repeatable `--ssh=<JSON>` arguments are collected separately.
+ */
+export function validateSshCliFlag(config: Record<string, string | null>): void {
+  if ('ssh' in config && config.ssh === null) {
+    throw new Error('Configuration error:\n--ssh requires a value (--ssh=<JSON>)');
+  }
+}
+
+function validateConfig(config: Record<string, string | null>, multiHost = false) {
+  const errors: string[] = [];
+
+  if (multiHost) {
+    // Multi-host mode: legacy single-host flags are disallowed to avoid ambiguity.
+    // bootstrapRegistry reads connection details ONLY from each --ssh JSON in
+    // this mode, so any legacy flag would be silently ignored — including
+    // --port (wrong port), --sudoPassword and --suPassword (elevation would run
+    // without the password). Reject the whole set rather than drop them quietly.
+    const legacyFlags = ['host', 'user', 'port', 'password', 'key', 'kerberos', 'transport',
+                         'sudoPassword', 'suPassword',
+                         'strictHostKeyChecking', 'knownHostsFile', 'gssapiDelegateCredentials'];
+    const set = legacyFlags.filter(f => config[f] !== undefined);
+    if (set.length > 0) {
+      errors.push(`Multi-host (--ssh) mode cannot be mixed with legacy single-host flags: ${set.map(s => '--' + s).join(', ')}`);
+    }
+  } else {
+    // Legacy single-host validation
+    if (!config.host) errors.push('Missing required --host (or use --ssh=<JSON> for multi-host mode)');
+    if (!config.user) errors.push('Missing required --user');
+    if (config.port && isNaN(Number(config.port))) errors.push('Invalid --port');
+
+    const transportExplicit = config.transport;
+    const kerberos = config.kerberos !== undefined && config.kerberos !== 'false';
+    // A value-less `--transport` is recorded as `null` by parseArgv; the nullish
+    // fallback below would treat it as absent and silently run the default ssh2
+    // transport, so a mistyped OpenSSH selection would run the wrong transport.
+    // Reject a present-but-value-less --transport like the other value-requiring
+    // flags.
+    if ('transport' in config && transportExplicit == null) {
+      errors.push('--transport requires a value (ssh2 or openssh)');
+    }
+    // --kerberos alone implies --transport=openssh
+    const transport = transportExplicit ?? (kerberos ? 'openssh' : 'ssh2');
+
+    if (transport !== 'ssh2' && transport !== 'openssh') {
+      errors.push(`Invalid --transport=${transport} (expected: ssh2 or openssh)`);
+    }
+    if (kerberos && transportExplicit === 'ssh2') {
+      errors.push('--kerberos requires --transport=openssh (remove --transport=ssh2 or pass --kerberos alone)');
+    }
+    if (transport === 'ssh2' && (config.knownHostsFile || config.strictHostKeyChecking)) {
+      errors.push('--knownHostsFile and --strictHostKeyChecking require --transport=openssh');
+    }
+    // OpenSSH options that require an explicit value. A value-less flag (e.g.
+    // `--strictHostKeyChecking` with no `=value`) is recorded as `null` by
+    // parseArgv; guarding on truthiness would silently skip validation and let
+    // buildTransportConfig drop the option, falling back to the default and (for
+    // strictHostKeyChecking) weakening the requested host-key policy. Detect the
+    // flag by property presence so a missing value is rejected with a clear error.
+    if ('strictHostKeyChecking' in config && !['yes', 'no', 'accept-new'].includes(config.strictHostKeyChecking!)) {
+      errors.push('--strictHostKeyChecking must be one of: yes, no, accept-new');
+    }
+    if ('gssapiDelegateCredentials' in config && !['yes', 'no'].includes(config.gssapiDelegateCredentials!)) {
+      errors.push('--gssapiDelegateCredentials must be yes or no');
+    }
+    if ('knownHostsFile' in config && !config.knownHostsFile) {
+      errors.push('--knownHostsFile requires a file path');
+    }
+    // GSSAPIDelegateCredentials is only emitted by the OpenSSH transport in the
+    // Kerberos auth branch (see OpenSshTransport.buildArgs). Accepting the flag
+    // without --kerberos would let a user request credential delegation while the
+    // server silently omits it, breaking second-hop SSO with no error. Require
+    // Kerberos auth so the requested delegation is actually honored.
+    if ('gssapiDelegateCredentials' in config && !kerberos) {
+      errors.push('--gssapiDelegateCredentials requires --kerberos');
+    }
+  }
+
   if (errors.length > 0) {
     throw new Error('Configuration error:\n' + errors.join('\n'));
   }
 }
 
-if (isCliEnabled) {
-  validateConfig(argvConfig);
+const isMultiHost = sshJsonArgs.length > 0;
+const hasLegacyCli = hasLegacyCliFlags(argvConfig);
+
+// Validate CLI-mode errors before TOML discovery/loading. Otherwise an
+// incomplete legacy invocation such as `--host=h` can auto-discover an unrelated
+// TOML file and report that TOML's parse/env error before the real missing
+// `--user` legacy CLI error.
+if (isCliEnabled || isTestMode) {
+  validateSshCliFlag(argvConfig);
+  if (isMultiHost) {
+    validateConfig(argvConfig, true);
+  } else if (hasLegacyCli) {
+    validateConfig(argvConfig, false);
+  }
 }
 
-// Command sanitization and validation
-export function sanitizeCommand(command: string): string {
-  if (typeof command !== 'string') {
-    throw new McpError(ErrorCode.InvalidParams, 'Command must be a string');
-  }
+function buildLegacyServerConfig(): ServerConfig | undefined {
+  if (!HOST || !USER) return undefined;
 
-  const trimmedCommand = command.trim();
-  if (!trimmedCommand) {
-    throw new McpError(ErrorCode.InvalidParams, 'Command cannot be empty');
-  }
+  // Precedence must match resolveAuthMode (kerberos > password > key), NOT a
+  // key-before-password order. When a legacy invocation supplies both
+  // --password and --key, password wins: classifying it as key auth would make
+  // prepareKeyContents read the (possibly stale/sample) key file → ENOENT, and
+  // could let the ssh2 transport prefer the key over the intended password
+  // (regression vs base `main`). See resolveAuthMode's doc-comment.
+  const authMode: AuthMode | undefined = resolveAuthMode({
+    kerberos: KERBEROS_FLAG,
+    password: PASSWORD,
+    key: KEY,
+  });
+  const resolvedTransport: 'ssh2' | 'openssh' =
+    (TRANSPORT_FLAG === 'openssh' || KERBEROS_FLAG) ? 'openssh' : 'ssh2';
 
-  // Length check
-  if (Number.isFinite(MAX_CHARS) && trimmedCommand.length > (MAX_CHARS as number)) {
-    throw new McpError(
-      ErrorCode.InvalidParams,
-      `Command is too long (max ${MAX_CHARS} characters)`
+  const cfg: ServerConfig = {
+    name: 'default',
+    host: HOST,
+    port: PORT,
+    username: USER,
+    transport: resolvedTransport,
+    authMode,
+  };
+  if (PASSWORD) cfg.password = PASSWORD;
+  // Only attach the key path when key auth actually wins. Attaching a stale
+  // --key on a password/kerberos source would make prepareKeyContents (ssh2)
+  // read the possibly-nonexistent file, and openssh's password/kerberos
+  // branches never use keyPath anyway. Expand a leading `~`/`~/` here too so the
+  // registry's lazy prepareKeyContents read (ssh2) and `ssh -i` (openssh) get a
+  // real path — same keyPath ~ class as parseServerConfigJson/buildTransportConfig.
+  if (KEY && authMode === 'key') cfg.keyPath = expandHome(KEY);
+  if (SUPASSWORD !== null && SUPASSWORD !== undefined) cfg.suPassword = sanitizePassword(SUPASSWORD);
+  if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) cfg.sudoPassword = sanitizePassword(SUDOPASSWORD);
+  if (KERBEROS_FLAG) cfg.kerberos = true;
+  if (GSSAPI_DELEGATE) cfg.gssapiDelegateCredentials = GSSAPI_DELEGATE as 'yes' | 'no';
+  if (KNOWN_HOSTS_FILE) cfg.knownHostsFile = KNOWN_HOSTS_FILE;
+  if (STRICT_HOST_KEY) cfg.strictHostKeyChecking = STRICT_HOST_KEY as 'yes' | 'no' | 'accept-new';
+  return cfg;
+}
+
+const cliSourceConfigs: ServerConfig[] = (() => {
+  if (isMultiHost) {
+    return sshJsonArgs.map(raw => parseServerConfigJson(raw));
+  }
+  if (hasLegacyCli) {
+    const legacy = buildLegacyServerConfig();
+    return legacy ? [legacy] : [];
+  }
+  return [];
+})();
+
+/**
+ * Resolve the explicit `--config` path from parsed argv.
+ *
+ * `parseArgv` records a value-less `--config` (no `=path`) as `null`. Silently
+ * coercing that to `undefined` would drop the explicit flag and fall back to
+ * `SSH_MCP_CONFIG`/default discovery, so a mistyped `--config` could start the
+ * process against the wrong configured source instead of failing fast. Reject a
+ * present-but-value-less `--config` like the other value-requiring flags.
+ * Returns the path when supplied, or `undefined` when the flag is absent.
+ */
+export function resolveCliConfigPath(
+  config: Record<string, string | null>,
+): string | undefined {
+  if (!('config' in config)) return undefined;
+  const value = config.config;
+  if (typeof value !== 'string') {
+    throw new Error('Configuration error:\n--config requires a value (--config=<path>)');
+  }
+  // `--config=` parses as an empty string. resolveConfig treats a truthy
+  // explicit path as the config to load but skips loadTomlFile for a falsy one,
+  // so an empty value would start the process while silently dropping the
+  // intended TOML top-level settings/discovery. Treat '' like the value-less
+  // `--config` case and fail fast (Codex 3541772406).
+  if (value === '') {
+    throw new Error('Configuration error:\n--config requires a value (--config=<path>)');
+  }
+  return expandHome(value);
+}
+
+const explicitConfigPath = (isCliEnabled || isTestMode)
+  ? resolveCliConfigPath(argvConfig)
+  : undefined;
+
+const resolvedConfig: ResolvedConfig = (isCliEnabled || isTestMode)
+  ? resolveConfig({
+      cliSources: cliSourceConfigs,
+      cliConfigPath: explicitConfigPath,
+      // An explicit CLI switch overrides TOML in either direction. Preserve
+      // `undefined` when the switch is absent so the loader can still honor
+      // `[webui].enabled`; bare `--webui` forces true and `--webui=false`
+      // forces false before token resolution and boot validation.
+      webuiEnabled: cliSwitchOverride(argvConfig, 'webui'),
+    })
+  : { sources: [], perSourceApproval: {}, defaultExplicit: false, requireConnection: true };
+
+if (isCliEnabled) {
+  if (!isMultiHost && !hasLegacyCli && resolvedConfig.sources.length === 0) {
+    throw new Error(
+      'Configuration error:\nMissing required --host (or use --ssh=<JSON>, --config=<path>, SSH_MCP_CONFIG, or a default ssh-mcp config.toml)',
     );
   }
-
-  return trimmedCommand;
 }
 
-function sanitizePassword(password: string | undefined): string | undefined {
-  if (typeof password !== 'string') return undefined;
-  // minimal check, do not log or modify content
-  if (password.length === 0) return undefined;
-  return password;
+export function sanitizeCommand(command: string): string {
+  return sanitizeCommandImpl(command, MAX_CHARS as number);
 }
 
-// Escape command for use in shell contexts (like pkill)
-export function escapeCommandForShell(command: string): string {
-  // Replace single quotes with escaped single quotes
-  return command.replace(/'/g, "'\"'\"'");
+function resolveTransport(opts: { transportFlag?: string | null; kerberos?: boolean }): 'ssh2' | 'openssh' {
+  if (opts.transportFlag === 'openssh' || opts.kerberos) return 'openssh';
+  return 'ssh2';
 }
 
-// SSH Connection Manager to maintain persistent connection
-export interface SSHConfig {
-  host: string;
+/**
+ * Resolve the effective auth mode from the provided credential flags.
+ *
+ * Precedence: kerberos > password > key. Password is ranked above key to
+ * preserve the legacy ssh2 behaviour (base `main`): when both a password and a
+ * key path are supplied, the password wins and the key file is never read. This
+ * avoids an ENOENT crash for password configs that still carry a stale/sample
+ * `--key=path/to/key`.
+ */
+export function resolveAuthMode(opts: {
+  kerberos?: boolean;
+  key?: string | null;
+  password?: string | null;
+}): 'kerberos' | 'key' | 'password' | undefined {
+  if (opts.kerberos) return 'kerberos';
+  if (opts.password) return 'password';
+  if (opts.key) return 'key';
+  return undefined;
+}
+
+/**
+ * Inputs for {@link buildTransportConfig}. Mirrors the legacy CLI flags but is
+ * passed explicitly so the resolution logic is pure and unit-testable.
+ */
+export interface BuildTransportConfigInputs {
+  host?: string | null;
   port: number;
-  username: string;
-  password?: string;
-  privateKey?: string;
-  suPassword?: string;
-  sudoPassword?: string;  // Password for sudo commands specifically (if different from suPassword)
+  username?: string | null;
+  password?: string | null;
+  key?: string | null;
+  suPassword?: string | null;
+  sudoPassword?: string | null;
+  kerberos?: boolean;
+  transportFlag?: string | null;
+  gssapiDelegateCredentials?: string | null;
+  knownHostsFile?: string | null;
+  strictHostKeyChecking?: string | null;
 }
 
-export class SSHConnectionManager {
-  private conn: Client | null = null;
-  private sshConfig: SSHConfig;
-  private isConnecting = false;
-  private connectionPromise: Promise<void> | null = null;
-  private suShell: any = null;  // Store the elevated shell session
-  private suPromise: Promise<void> | null = null;
-  private isElevated = false;  // Track if we're in su mode
+export interface BuildTransportConfigOptions {
+  /**
+   * When true, an ssh2 key config records `keyPath` but does NOT read the key
+   * file contents into `privateKey`. The read is deferred to the registry's
+   * lazy `prepareKeyContents` hook on the first tool call. Used by the legacy
+   * single-host bootstrap so a key mounted after process launch still works —
+   * matching the pre-registry behavior where the key was only read inside
+   * getOrCreateTransport() on first use, not at startup.
+   */
+  deferKeyRead?: boolean;
+}
 
-  constructor(config: SSHConfig) {
-    this.sshConfig = config;
+export async function buildTransportConfig(
+  inputs: BuildTransportConfigInputs,
+  opts: BuildTransportConfigOptions = {},
+): Promise<TransportConfig> {
+  const { host, username } = inputs;
+  if (!host || !username) {
+    throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
   }
 
-  async connect(): Promise<void> {
-    if (this.conn && this.isConnected()) {
-      return; // Already connected
-    }
+  const transport = resolveTransport({ transportFlag: inputs.transportFlag, kerberos: inputs.kerberos });
+  const authMode = resolveAuthMode({
+    kerberos: inputs.kerberos,
+    password: inputs.password,
+    key: inputs.key,
+  });
 
-    if (this.isConnecting && this.connectionPromise) {
-      return this.connectionPromise; // Wait for ongoing connection
-    }
+  const cfg: TransportConfig = {
+    host,
+    port: inputs.port,
+    username,
+    transport,
+    authMode,
+  };
 
-    this.isConnecting = true;
-    this.connectionPromise = new Promise((resolve, reject) => {
-      this.conn = new Client();
-
-      const timeoutId = setTimeout(() => {
-        this.conn?.end();
-        this.conn = null;
-        this.isConnecting = false;
-        this.connectionPromise = null;
-        reject(new McpError(ErrorCode.InternalError, 'SSH connection timeout'));
-      }, 30000); // 30 seconds connection timeout
-
-      this.conn.on('ready', async () => {
-        clearTimeout(timeoutId);
-        this.isConnecting = false;
-
-        // In test mode, don't wait for su elevation during connection setup, as it
-        // may cause JSON-RPC server initialization to hang. Instead, elevation will
-        // be triggered on-demand when a command is executed.
-        // In production, elevation during connection is desirable for robustness.
-        if (this.sshConfig.suPassword && !process.env.SSH_MCP_TEST) {
-          try {
-            await this.ensureElevated();
-          } catch (err) {
-            // Do not reject the connection; just log the error. Subsequent commands
-            // will either use the su shell if available or fall back to normal execution.
-          }
-        }
-
-        resolve();
-      });
-
-      this.conn.on('error', (err: Error) => {
-        clearTimeout(timeoutId);
-        this.conn = null;
-        this.isConnecting = false;
-        this.connectionPromise = null;
-        reject(new McpError(ErrorCode.InternalError, `SSH connection error: ${err.message}`));
-      });
-
-      this.conn.on('end', () => {
-        console.error('SSH connection ended');
-        this.conn = null;
-        this.isConnecting = false;
-        this.connectionPromise = null;
-      });
-
-      this.conn.on('close', () => {
-        console.error('SSH connection closed');
-        this.conn = null;
-        this.isConnecting = false;
-        this.connectionPromise = null;
-      });
-
-      this.conn.connect(this.sshConfig);
-    });
-
-    return this.connectionPromise;
-  }
-
-  isConnected(): boolean {
-    return this.conn !== null && (this.conn as any)._sock && !(this.conn as any)._sock.destroyed;
-  }
-
-  getSudoPassword(): string | undefined {
-    return this.sshConfig.sudoPassword;
-  }
-
-  getSuPassword(): string | undefined {
-    return this.sshConfig.suPassword;
-  }
-
-  async setSuPassword(pwd?: string): Promise<void> {
-    this.sshConfig.suPassword = pwd;
-    if (pwd) {
-      try {
-        await this.ensureElevated();
-      } catch (err) {
-        console.error('setSuPassword: failed to elevate to su shell:', err);
-      }
-    } else {
-      // If clearing suPassword, drop any existing suShell
-      if (this.suShell) {
-        try { this.suShell.end(); } catch (e) { /* ignore */ }
-        this.suShell = null;
-        this.isElevated = false;
-      }
+  if (inputs.password) cfg.password = inputs.password;
+  if (inputs.key) {
+    // Expand a leading `~`/`~/` before storing or reading. Neither `ssh -i`
+    // (openssh) nor fs.readFile (ssh2) shell-expands `~`, so the expanded path
+    // must be what we persist AND what the eager ssh2 read below opens — same
+    // keyPath ~ class as parseServerConfigJson / the TOML loader.
+    const expandedKey = expandHome(inputs.key)!;
+    cfg.keyPath = expandedKey;
+    // ssh2 transport needs the key contents, not the path — but only when the
+    // key is the resolved auth mode. A password config that also carries a
+    // stale/sample --key must NOT read the (possibly nonexistent) key file,
+    // which would otherwise throw ENOENT before connecting (regression vs base
+    // main, where password took precedence and the key was never read).
+    //
+    // deferKeyRead skips the eager read entirely so the registry's lazy
+    // prepareKeyContents hook reads it on first tool call instead. The legacy
+    // single-host bootstrap uses this so a key mounted after process launch is
+    // still honored — startup must not read the key file (Codex 3541767256).
+    if (transport === 'ssh2' && authMode === 'key' && !opts.deferKeyRead) {
+      const fs = await import('fs/promises');
+      cfg.privateKey = await fs.readFile(expandedKey, 'utf8');
     }
   }
+  if (inputs.suPassword !== null && inputs.suPassword !== undefined) cfg.suPassword = sanitizePassword(inputs.suPassword);
+  if (inputs.sudoPassword !== null && inputs.sudoPassword !== undefined) cfg.sudoPassword = sanitizePassword(inputs.sudoPassword);
+  if (inputs.kerberos) cfg.kerberos = true;
+  if (inputs.gssapiDelegateCredentials) cfg.gssapiDelegateCredentials = inputs.gssapiDelegateCredentials as 'yes' | 'no';
+  if (inputs.knownHostsFile) cfg.knownHostsFile = inputs.knownHostsFile;
+  if (inputs.strictHostKeyChecking) cfg.strictHostKeyChecking = inputs.strictHostKeyChecking as 'yes' | 'no' | 'accept-new';
 
-  private async ensureElevated(): Promise<void> {
-    if (this.isElevated && this.suShell) return;
-    if (!this.sshConfig.suPassword) return;
+  return cfg;
+}
 
-    if (this.suPromise) return this.suPromise;
+// =============================================================================
+// Transport registry — lazy init, single entry for legacy single-host mode.
+// =============================================================================
 
-    this.suPromise = new Promise((resolve, reject) => {
-      const conn = this.getConnection();
+const registry = new TransportRegistry(prepareKeyContents);
 
-      // Add a safety timeout so elevation doesn't hang forever
-      const timeoutId = setTimeout(() => {
-        this.suPromise = null;
-        reject(new McpError(ErrorCode.InternalError, 'su elevation timed out'));
-      }, 10000);  // 10 second timeout for elevation
-
-      conn.shell({ term: 'xterm', cols: 80, rows: 24 }, (err: Error | undefined, stream: ClientChannel) => {
-        if (err) {
-          clearTimeout(timeoutId);
-          this.suPromise = null;
-          reject(new McpError(ErrorCode.InternalError, `Failed to start interactive shell for su: ${err.message}`));
-          return;
-        }
-
-        let buffer = '';
-        let passwordSent = false;
-        const cleanup = () => {
-          try { stream.removeAllListeners('data'); } catch (e) { /* ignore */ }
-        };
-
-        const onData = (data: Buffer) => {
-          const text = data.toString();
-          buffer += text;
-
-          // If we haven't sent the password yet, look for the password prompt
-          if (!passwordSent && /password[: ]/i.test(buffer)) {
-            passwordSent = true;
-            stream.write(this.sshConfig.suPassword + '\n');
-            // Don't return; keep looking for root prompt
-          }
-
-          // After password is sent, look for any root indicator
-          // Look for '#' which indicates root prompt (may be followed by spaces, escape codes, etc)
-          if (passwordSent) {
-            if (/#/.test(buffer)) {
-              clearTimeout(timeoutId);
-              cleanup();
-              this.suShell = stream;
-              this.isElevated = true;
-              this.suPromise = null;
-              resolve();
-              return;
-            }
-          }
-
-          // Detect authentication failure messages
-          if (/authentication failure|incorrect password|su: .*failed|su: failure/i.test(buffer)) {
-            clearTimeout(timeoutId);
-            cleanup();
-            this.suPromise = null;
-            reject(new McpError(ErrorCode.InternalError, `su authentication failed: ${buffer}`));
-            return;
-          }
-        };
-
-        stream.on('data', onData);
-
-        stream.on('close', () => {
-          clearTimeout(timeoutId);
-          if (!this.isElevated) {
-            this.suPromise = null;
-            reject(new McpError(ErrorCode.InternalError, 'su shell closed before elevation completed'));
-          }
-        });
-
-        // Kick off the su command
-        stream.write('su -\n');
-      });
-    });
-
-    return this.suPromise;
-  }
-
-  async ensureConnected(): Promise<void> {
-    if (!this.isConnected()) {
-      await this.connect();
-    }
-  }
-
-  getConnection(): Client {
-    if (!this.conn) {
-      throw new McpError(ErrorCode.InternalError, 'SSH connection not established');
-    }
-    return this.conn;
-  }
-
-  close(): void {
-    if (this.conn) {
-      if (this.suShell) {
-        try { this.suShell.end(); } catch (e) { /* ignore */ }
-        this.suShell = null;
-        this.isElevated = false;
-      }
-      this.conn.end();
-      this.conn = null;
-    }
+export async function prepareKeyContents(cfg: ServerConfig): Promise<void> {
+  // ssh2 transport reads key contents in memory; openssh uses -i path.
+  // Gate on authMode === 'key': buildTransportConfig() still records keyPath
+  // even when password auth takes precedence over a stale/sample --key, so a
+  // config such as `--password=... --key=/stale` must NOT read the (possibly
+  // nonexistent) key file here — otherwise the first tool call fails with
+  // ENOENT instead of using the password (Codex 3549295046). Mirrors the eager
+  // read's `authMode === 'key'` guard in buildTransportConfig().
+  //
+  // Once this hook loads a keyPath, re-read it on every later init attempt. The
+  // registry retries rejected initialization with the same config object; the
+  // internal marker distinguishes file-loaded contents from an explicit inline
+  // key so a key rotation can recover without a process restart.
+  if (
+    cfg.authMode === 'key' &&
+    cfg.transport === 'ssh2' &&
+    cfg.keyPath &&
+    (!cfg.privateKey || cfg.privateKeyDerivedFromKeyPath === true)
+  ) {
+    const fs = await import('fs/promises');
+    cfg.privateKey = await fs.readFile(cfg.keyPath, 'utf8');
+    cfg.privateKeyDerivedFromKeyPath = true;
   }
 }
 
-let connectionManager: SSHConnectionManager | null = null;
+async function bootstrapRegistry(): Promise<void> {
+  // Unified bootstrap (toml-config design): resolvedConfig.sources already
+  // carries every registered host — multi-host --ssh JSON, the legacy
+  // single-host config, and any [[sources]] from a TOML — built by
+  // resolveConfig(). Iterate it as the single source of truth. The
+  // kerberos>password>key precedence and gated key read from PR #2/#3 are
+  // preserved via buildLegacyServerConfig (uses resolveAuthMode).
+  //
+  // Key reads are DEFERRED: prepareKeyContents is passed as the registry's
+  // lazy prepareConfig hook (see `new TransportRegistry(prepareKeyContents)`)
+  // and runs inside get(name), not here — so one host with a missing/unmounted
+  // key path can't break startup or list-servers for the other healthy hosts
+  // (multi-host R2 hardening carried forward from pr/multi-host).
+  for (const cfg of resolvedConfig.sources) {
+    registry.register(cfg);
+  }
+  applyRegistryConnectionPolicy(registry, resolvedConfig);
+}
+
+/**
+ * Wire the resolved connection policy onto a registry whose sources are already
+ * registered. Split out (and exported) so the explicit-default / fallback /
+ * require_connection opt-out matrix is unit-testable without booting the server.
+ *
+ * Two independent knobs:
+ *  - defaultExplicit: call setDefault() ONLY when the user explicitly chose a
+ *    default. Falling through to register()'s first-registered fallback leaves
+ *    the registry's defaultExplicit=false, so a multi-source config with no
+ *    explicit default still rejects an omitted connectionName (the headline
+ *    security fix) instead of silently routing to the first host.
+ *  - requireConnection: when false, opt out of that guard entirely. Absent the
+ *    field (older ResolvedConfig shape / no [server].require_connection) it
+ *    defaults to safe (guard ON).
+ */
+export function applyRegistryConnectionPolicy(
+  reg: Pick<TransportRegistry, 'setDefault' | 'setRequireConnectionWhenMulti'>,
+  config: ResolvedConfig,
+): void {
+  const requireConnection = config.requireConnection ?? true;
+  reg.setRequireConnectionWhenMulti(requireConnection);
+  if (config.defaultExplicit && config.defaultName) {
+    reg.setDefault(config.defaultName);
+  }
+}
+
+/**
+ * Profile label used before registry target resolution succeeds.
+ *
+ * Match TransportRegistry.resolveRegisteredName() exactly: only a falsy name
+ * is omitted. In particular, whitespace is a supplied (invalid) name, so a
+ * rejected call must remain attributed to that unresolved value instead of a
+ * real default host.
+ */
+export function preResolutionProfileName(
+  connectionName: string | undefined,
+  defaultName: string | null,
+  wouldRejectOmittedName: boolean,
+): string {
+  if (connectionName) return connectionName;
+  // An omitted/blank name that the registry would REJECT (multi-source, no
+  // explicit default, guard on) never lands on a host: resolveName() throws
+  // before selection. Attributing that rejected call to getDefaultName() (the
+  // first-registered host) would corrupt audit profile for exactly the guard
+  // case. Mirror the guard and label it unresolved instead of a real host.
+  if (wouldRejectOmittedName) return '(unresolved)';
+  return defaultName ?? 'default';
+}
+
+/** Effective profile/connection name for gating + audit attribution. */
+function resolvedProfileName(connectionName?: string): string {
+  return preResolutionProfileName(
+    connectionName,
+    registry.getDefaultName(),
+    registry.wouldRejectOmittedName(),
+  );
+}
+
+export function buildApprovalProfile(
+  id: string,
+  perSourceApproval: Record<string, ApprovalMode> = {},
+  source?: { description?: string },
+): ResolvedSource {
+  const mode = Object.prototype.hasOwnProperty.call(perSourceApproval, id)
+    ? perSourceApproval[id]
+    : undefined;
+  return {
+    id,
+    ...(source?.description ? { description: source.description } : {}),
+    ...(mode ? { approval: { mode } } : {}),
+  };
+}
+
+/**
+ * Finding-4 (Codex R4) revalidation after an awaited approval.
+ *
+ * A manual/smart approval can block for a long time. During that wait a config
+ * hot-reload (closeAll bumps the registry's reload generation) can remove or
+ * re-parameterize the source, but the transport `current` was already dialed
+ * against the PRE-approval config. Running the approved command on it would
+ * bypass the swap (execute on a stale host, or on a source that no longer
+ * exists). Compare the generation captured BEFORE the approval against the live
+ * one: if it changed, re-acquire the transport against the CURRENT config
+ * (registry.get() re-resolves the name — throwing a clear error if it was
+ * removed — and re-dials the new params) and re-sample the profile so audit
+ * attribution matches the transport actually used.
+ *
+ * Returns the transport to execute with and its effective audit profile id.
+ * When no reload landed, returns the originals unchanged (single sync generation
+ * read — no await — so no further reload can interleave before the caller runs).
+ */
+export async function reacquireTransportIfReloaded(
+  reg: Pick<TransportRegistry, 'getReloadGeneration' | 'get' | 'profile'>,
+  connectionName: string | undefined,
+  current: ISshTransport,
+  generationBeforeApproval: number,
+): Promise<{ transport: ISshTransport; profile: string }> {
+  if (reg.getReloadGeneration() === generationBeforeApproval) {
+    return { transport: current, profile: reg.profile(connectionName).id };
+  }
+  const transport = await reg.get(connectionName);
+  return { transport, profile: reg.profile(connectionName).id };
+}
+
+/**
+ * Approve and acquire one stable source across config reloads.
+ *
+ * The canonical source id is sampled before the first await. Every attempt
+ * samples its approval profile inside one stable reload generation, then gates
+ * that source before registry.get() can initialize/elevate a transport. A stale
+ * allow or transport is discarded and retried against the same source id. Gate
+ * rejections (denial, timeout, cancellation, backend error) are always terminal:
+ * a concurrent reload must never turn a fail-closed decision into a retry under
+ * a potentially looser policy.
+ */
+export async function approveTransportForCurrentConfig(params: {
+  reg: Pick<TransportRegistry, 'getReloadGeneration' | 'get' | 'profile'>;
+  profile: ResolvedSource;
+  gate: (profile: ResolvedSource) => Promise<ApprovalDecision>;
+  maxAttempts?: number;
+}): Promise<{ transport: ISshTransport; profile: string; approval: ApprovalDecision }> {
+  const resolvedName = params.profile.id;
+  const maxAttempts = params.maxAttempts ?? 10;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const generationBeforeApproval = params.reg.getReloadGeneration();
+    const effectiveProfile = params.reg.profile(resolvedName);
+    // profile() and generation reads are synchronous, but keeping both reads
+    // makes the identity/generation pairing explicit and testable even for a
+    // registry seam that changes generation during profile resolution.
+    if (params.reg.getReloadGeneration() !== generationBeforeApproval) {
+      continue;
+    }
+    // Never catch/retry a gate rejection. The error is the authoritative result
+    // for this execution identity even if reload completes while it is pending.
+    const approval = await params.gate(effectiveProfile);
+
+    if (params.reg.getReloadGeneration() !== generationBeforeApproval) {
+      continue;
+    }
+
+    // Approval is current, so transport initialization/elevation may proceed.
+    let transport: ISshTransport;
+    try {
+      transport = await params.reg.get(resolvedName);
+    } catch (err) {
+      // The operator's decision DID happen. A failed acquisition (unreadable
+      // lazy key, connect failure, source removed after the approval) must not
+      // silently discard it: attach the decision to the error so both tool
+      // handlers' catch paths (getApprovalDecisionFromError) audit the real
+      // decision instead of recording a synthetic `approval:not-run` denial.
+      if (err !== null && typeof err === 'object'
+          && (err as { approval?: ApprovalDecision }).approval === undefined) {
+        (err as { approval?: ApprovalDecision }).approval = approval;
+      }
+      throw err;
+    }
+    if (params.reg.getReloadGeneration() === generationBeforeApproval) {
+      return { transport, profile: effectiveProfile.id, approval };
+    }
+
+    // A reload landed while get() was initializing. Registry.get() already
+    // discarded/retried stale transport state; loop to authorize the current
+    // transport configuration before execution.
+  }
+
+  throw new Error(`config reloaded ${maxAttempts} times during approval; retry command after reloads settle`);
+}
+
+export function approvalTargetForConnection(
+  reg: TransportRegistry,
+  connectionName?: string,
+): { profile: string; approvalProfile: ResolvedSource } {
+  const id = reg.resolveRegisteredName(connectionName);
+  // Registry state is the hot-reload source of truth; resolvedConfig is the boot
+  // snapshot and may no longer describe this source.
+  return { profile: id, approvalProfile: reg.profile(id) };
+}
+
+export function appendDescriptionComment(command: string, description?: string): string {
+  if (!description) return command;
+  const safeDescription = description
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/[\t\f\v ]+/g, ' ')
+    .trim();
+  return safeDescription ? `${command} # ${safeDescription}` : command;
+}
+
+// =============================================================================
+// Approval engine + OPTIONAL audit-truth seam (Decision D2).
+//
+// The approval engine is the source of truth for whether a command runs. The
+// audit seam is OPTIONAL: when `src/audit/` is part of the build it logs the
+// real decision; when absent (e.g. on `pr/toml-config`, this lane's base) it
+// no-ops. `auditSink` starts as a no-op so the exec/sudo-exec handlers can call
+// it unconditionally; `wireApprovalAndAudit()` upgrades it at boot.
+// =============================================================================
+
+let approvalEngine: ApprovalDispatcher | null = null;
+let auditSink: AuditSink = { record() { /* no-op until wired (or audit absent) */ } };
+
+/**
+ * Resolve the [approval]/per-source config into the concrete engine input.
+ * Returns null for the legacy CLI path (no [approval] section and no per-source
+ * overrides). Shared by buildProductionApprovalEngine (which builds the engine)
+ * and wireApprovalAndAudit (which reuses the SAME resolved defaultMode +
+ * perSourceModes for the manual-without-resolver boot warning) so the warning
+ * can never disagree with the mode the engine actually runs.
+ */
+export function resolveApprovalEngineInput(
+  config: ResolvedConfig = resolvedConfig,
+): BuildEngineFromConfigInput | null {
+  // Delegate to the shared pure resolver so this boot path and the config
+  // hot-reload path (src/config/reloader.ts) can NEVER disagree about how a
+  // ResolvedConfig maps to the effective default/per-source modes. See
+  // src/config/approval-policy.ts for the precedence rationale.
+  return resolveApprovalEngineInputForConfig(config);
+}
+
+/** Effective configured mode used when audit must record a pre-gate failure. */
+export function resolveConfiguredApprovalMode(
+  profileId: string,
+  config: ResolvedConfig = resolvedConfig,
+): ApprovalMode {
+  const input = resolveApprovalEngineInput(config);
+  if (input === null) return 'yolo';
+  const profile = buildApprovalProfile(
+    profileId,
+    config.perSourceApproval ?? {},
+  );
+  return profile.approval?.mode ?? input.defaultMode ?? 'manual';
+}
+
+/** Effective live mode used when audit must record a pre-gate failure. */
+export function resolveLiveApprovalMode(
+  profileId: string,
+  engine: Pick<ApprovalDispatcher, 'getEffectiveMode'> | null,
+): ApprovalMode {
+  return engine?.getEffectiveMode(profileId) ?? 'yolo';
+}
+
+export function approvalResolverWarningFromInput(
+  input: BuildEngineFromConfigInput | null,
+  params: { webuiEnabled: boolean; resolverWired: boolean },
+): string | null {
+  if (input === null) return null;
+  return manualWithoutResolverWarning({
+    webuiEnabled: params.webuiEnabled,
+    defaultMode: input.defaultMode,
+    perSourceModes: input.perSourceModes,
+    resolverWired: params.resolverWired,
+  });
+}
+
+/**
+ * Build the production approval engine from resolvedConfig. Returns null for
+ * the legacy CLI path (no [approval] section and no per-source overrides) so
+ * the gate keeps its backward-compatible `legacy:no-engine` allow.
+ *
+ * Throws (fatal at boot):
+ *   - manual mode requested but WebUI disabled (gate-12 invariant)
+ *   - smart mode requested but [approval.llm] missing endpoint or model
+ */
+export function buildProductionApprovalEngine(
+  webuiActive: boolean,
+  config: ResolvedConfig = resolvedConfig,
+): ApprovalDispatcher | null {
+  const approvalCfg = config.approval;
+  const perSourceApproval = config.perSourceApproval ?? {};
+  const perSourceModes: ApprovalMode[] = Object.values(perSourceApproval);
+  const approvalLlmOnly = approvalCfg !== undefined
+    && approvalCfg.mode === undefined
+    && approvalCfg.fail_closed === undefined
+    && approvalCfg.llm !== undefined;
+  // A synthetic engine has no selected approval mode. It exists only while the
+  // WebUI is active so operators can live-switch from the legacy yolo baseline.
+  // Preserve an LLM-only block on that engine so a supported smart provider is
+  // switchable without turning the otherwise-inert config into a boot-time mode.
+  const isSyntheticWebUIEngine = perSourceModes.length === 0
+    && (approvalCfg === undefined || approvalLlmOnly);
+
+  // Resolve config through the SHARED helper so the engine we build and the
+  // manual-without-resolver boot warning (wireApprovalAndAudit) can never
+  // disagree about the effective default/per-source modes. It returns null on
+  // the legacy CLI and LLM-only paths; keep that no-engine allow UNLESS the
+  // WebUI is active and wants a live-switchable synthetic engine.
+  const resolved = resolveApprovalEngineInput(config);
+  if (resolved === null && !(isSyntheticWebUIEngine && webuiActive)) {
+    return null;
+  }
+  const input: BuildEngineFromConfigInput = {
+    ...(resolved ?? (approvalLlmOnly ? { llm: approvalCfg?.llm } : {})),
+    // For a synthetic WebUI engine, pass an explicit `yolo` baseline. Leaving
+    // this undefined makes buildApprovalEngineFromConfig coerce it to `manual`,
+    // which would enqueue/block every exec even though no approval mode was
+    // configured. Per-source and explicit [approval].mode configs keep the
+    // resolved default from the shared helper.
+    defaultMode: resolved?.defaultMode ?? (isSyntheticWebUIEngine ? 'yolo' : undefined),
+    // Seed per-source static overrides into the live mode store so a live mode
+    // switch starts from the operator's configured baseline (mode-switch lane).
+    staticOverrides: perSourceApproval,
+  };
+  return buildApprovalEngineFromConfig(input, {
+    manualOpts: { webuiEnabled: webuiActive },
+  });
+}
+
+/** Return the explicit value of a bare/string boolean CLI switch, or undefined when absent. */
+function cliSwitchOverride(args: Record<string, unknown>, key: string): boolean | undefined {
+  if (!(key in args)) return undefined;
+  const value = args[key];
+  return !(typeof value === 'string' && value.toLowerCase() === 'false');
+}
+
+/** Resolve a bare/string boolean CLI switch without treating `--flag=false` as enabled. */
+export function isCliSwitchEnabled(args: Record<string, unknown>, key: string): boolean {
+  return cliSwitchOverride(args, key) === true;
+}
+
+/** Decide whether the WebUI will be active at boot (TOML or --webui). */
+function isWebUIActive(): boolean {
+  // CLI presence wins in either direction: bare `--webui` enables the server,
+  // while explicit `--webui=false` suppresses even TOML enabled=true. Only an
+  // absent CLI switch delegates to the TOML setting.
+  return cliSwitchOverride(argvConfig, 'webui')
+    ?? (resolvedConfig.webui?.enabled === true);
+}
+
+/**
+ * True when a driver that settles the manual-approval queue is wired into this
+ * build. This lane includes the WebUI manual-approval POST route and passes the
+ * in-process ApprovalDispatcher through buildWebUIApprovalQueueAdapter(), so a
+ * WebUI-enabled manual queue has a resolver.
+ */
+function isApprovalResolverWired(): boolean {
+  return true;
+}
+
+/**
+ * Wire the approval engine into the gate and load the optional audit sink.
+ * Safe to call before the MCP transport connects so the first exec is gated.
+ */
+async function wireApprovalAndAudit(): Promise<void> {
+  // Keep the module-level `approvalEngine` binding: the read-only WebUI wiring
+  // downstream (makeApprovalModeLookup + buildWebUIApprovalQueueAdapter) reads
+  // it to surface the live engine to the dashboard.
+  const webuiActive = isWebUIActive();
+  approvalEngine = buildProductionApprovalEngine(webuiActive);
+
+  // Non-fatal boot advisory: manual mode boots a queue with no driver when the
+  // approval-engine lane runs standalone, ahead of its child WebUI lane. Boot
+  // still succeeds (the queue exists, it just times out until a resolver lands);
+  // warn so the operator is not left wondering why every command hangs.
+  const input = resolveApprovalEngineInput();
+  const warning = approvalResolverWarningFromInput(input, {
+    webuiEnabled: webuiActive,
+    resolverWired: isApprovalResolverWired(),
+  });
+  if (warning) {
+    console.error(`WARN: ${warning}`);
+  }
+  setApprovalEngine(approvalEngine);
+  auditSink = await loadAuditSink({
+    auditDir: resolvedConfig.server?.audit_dir,
+    auditMaxBytes: resolvedConfig.server?.audit_max_bytes,
+  });
+}
+
+/** Bridge the in-process approval dispatcher to the read-only WebUI queue shape. */
+export function buildWebUIApprovalQueueAdapter(engine: ApprovalDispatcher | null): ManualApprovalQueue | undefined {
+  if (!engine) return undefined;
+
+  const enqWrappers = new Map<Function, (p: any) => void>();
+  const resWrappers = new Map<Function, (p: any, d: any) => void>();
+  const toBoundedWebUIText = (value: string): string =>
+    capThenRedact(value, AUDIT_COMMAND_MIN_CAP_BYTES).text;
+  const toWebUI = (p: any): WebUIPendingApproval => {
+    const description = p.context?.description;
+    return {
+      id: p.id,
+      profile: p.context?.profile?.id ?? 'default',
+      tool: p.context?.tool ?? 'exec',
+      command: toBoundedWebUIText(p.context?.command ?? ''),
+      description: description === undefined ? undefined : toBoundedWebUIText(description),
+      enqueuedAt: p.enqueued_at,
+    };
+  };
+
+  return {
+    list: () => engine.listPending().map(toWebUI),
+    resolve: (id, decision: WebUIApprovalDecision) =>
+      engine.resolvePending(id, decision.decision, decision.reason, decision.decided_by),
+    on(event, listener) {
+      if (event === 'enqueue') {
+        const wrap = (p: any) => (listener as (p: WebUIPendingApproval) => void)(toWebUI(p));
+        enqWrappers.set(listener, wrap);
+        engine.on('enqueue', wrap);
+      } else if (event === 'resolve') {
+        const wrap = (p: any, d: WebUIApprovalDecision) =>
+          (listener as (p: WebUIPendingApproval, d: WebUIApprovalDecision) => void)(toWebUI(p), d);
+        resWrappers.set(listener, wrap);
+        engine.on('resolve', wrap);
+      }
+    },
+    off(event, listener) {
+      if (event === 'enqueue') {
+        const wrap = enqWrappers.get(listener);
+        if (wrap) {
+          engine.off('enqueue', wrap);
+          enqWrappers.delete(listener);
+        }
+      } else if (event === 'resolve') {
+        const wrap = resWrappers.get(listener);
+        if (wrap) {
+          engine.off('resolve', wrap);
+          resWrappers.delete(listener);
+        }
+      }
+    },
+  };
+}
+
+/** Bridge the optional audit seam to the read-only WebUI audit tail shape. */
+function buildWebUIAuditTailAdapter(sink: AuditSink): WebUIAuditTail | undefined {
+  if (typeof sink.tail !== 'function' || typeof sink.on !== 'function') return undefined;
+
+  const toWebUI = (r: any) => ({
+    ts: r.ts,
+    id: r.id,
+    profile: r.profile,
+    tool: r.tool,
+    command: r.command,
+    description: r.description,
+    approval: r.approval,
+    exec: r.exec
+      ? {
+          exit_code: r.exec.exit_code ?? undefined,
+          duration_ms: r.exec.duration_ms,
+          stdout_truncated: r.exec.stdout_truncated,
+          stderr_truncated: r.exec.stderr_truncated,
+          stdout: r.exec.stdout,
+          stderr: r.exec.stderr,
+        }
+      : undefined,
+  });
+  const listenerMap = new Map<Function, (r: unknown) => void>();
+
+  return {
+    tail: async opts => {
+      const records = await sink.tail!(opts);
+      return records.map(toWebUI);
+    },
+    on: (event, listener) => {
+      const wrap = (r: unknown) => listener(toWebUI(r));
+      listenerMap.set(listener, wrap);
+      sink.on!(event, wrap);
+    },
+    off: (event, listener) => {
+      const wrap = listenerMap.get(listener);
+      if (wrap && typeof sink.off === 'function') {
+        sink.off(event, wrap);
+        listenerMap.delete(listener);
+      }
+    },
+  };
+}
+
+export function makeApprovalModeLookup(
+  deps: {
+    perSourceApproval?: Record<string, ApprovalMode>;
+    getEngine?: () => Pick<ApprovalDispatcher, 'defaultMode'> | null;
+    modeController?: Pick<WebUIModeController, 'getEffectiveMode'>;
+  } = {},
+): (profileName: string) => string {
+  const perSource = deps.perSourceApproval ?? resolvedConfig.perSourceApproval ?? {};
+  // Engine read stays lazy (per lookup, like the previous module-level read)
+  // so the adapter never caches a stale null/instance across engine wiring.
+  const getEngine = deps.getEngine ?? (() => approvalEngine);
+  // Production passes the same live controller used by the mutation routes.
+  // Its dispatcher-backed lookup observes in-memory profile/global changes made
+  // after startup instead of falling back to the static TOML snapshot below.
+  const modeController = deps.modeController;
+  if (modeController) {
+    return (name: string): string => modeController.getEffectiveMode(name);
+  }
+  // Mirror exactly what ApprovalDispatcher.decide() enforces so the WebUI
+  // never advertises a gate that is not actually applied:
+  //   - no engine wired        -> gateApproval() takes the legacy no-engine
+  //                               allow path (yolo-equivalent);
+  //   - per-source override set -> decide() honors ctx.profile.approval.mode,
+  //                               which the handlers thread in via
+  //                               approvalProfileForConnection();
+  //   - otherwise               -> decide() falls back to the engine's own
+  //                               resolved default mode.
+  return (name: string): string => {
+    const engine = getEngine();
+    if (!engine) return 'yolo';
+    // Own-property check like buildApprovalProfile(): a profile named
+    // `toString`/`constructor`/another Object.prototype key must not read the
+    // inherited member off the plain override object — /api/profiles would
+    // then serialize a function/object instead of falling back to the
+    // engine's default mode that decide() actually enforces (Codex 3568536828).
+    return Object.prototype.hasOwnProperty.call(perSource, name)
+      ? perSource[name]
+      : engine.defaultMode;
+  };
+}
+
+/**
+ * Bridge the in-process dispatcher to the WebUI's ModeController contract
+ * (PR-7). All mutation is in-memory only (Decision D3): this adapter calls the
+ * dispatcher's mode store, which never touches disk. Returns undefined when no
+ * engine is wired (mode switching disabled).
+ */
+function buildWebUIModeController(engine: ApprovalDispatcher | null): WebUIModeController | undefined {
+  if (!engine) return undefined;
+  const wrappers = new Map<Function, (e: any) => void>();
+  return {
+    availableModes: () => engine.availableModes(),
+    getGlobalMode: () => engine.getGlobalMode(),
+    getEffectiveMode: (profileId: string) => engine.getEffectiveMode(profileId),
+    setProfileMode: (profileId: string, mode: string | null) =>
+      engine.setProfileMode(profileId, mode as ApprovalMode | null),
+    setGlobalMode: (mode: string) => engine.setGlobalMode(mode as ApprovalMode),
+    on(event, listener) {
+      const wrap = (e: any) => listener(e);
+      wrappers.set(listener, wrap);
+      engine.on(event, wrap);
+    },
+    off(event, listener) {
+      const wrap = wrappers.get(listener);
+      if (wrap) {
+        engine.off(event, wrap);
+        wrappers.delete(listener);
+      }
+    },
+  };
+}
+
+/**
+ * Bridge the TransportRegistry's in-memory description override to the WebUI's
+ * SourceController contract (PR-8). All mutation is in-memory only (Decision
+ * D3): `registry.setDescription()` updates a Map and NEVER writes the TOML
+ * config. The approval engine re-reads the effective description on its next
+ * decision because `registry.profile()` applies the override on every call —
+ * so an edit takes effect live without a restart. This adapter owns the
+ * `source-updated` fan-out (the registry is a pure state-holder, like the
+ * ApprovalModeStore beneath the mode controller).
+ */
+function buildWebUISourceController(reg: TransportRegistry): WebUISourceController {
+  const listeners = new Set<(e: WebUISourceUpdatedEvent) => void>();
+  return {
+    hasSource: (id: string) => reg.names().includes(id),
+    getEffectiveDescription: (id: string) => reg.getEffectiveDescription(id),
+    setDescription(id: string, description: string | null): WebUISourceUpdatedEvent {
+      const effective = reg.setDescription(id, description);
+      const event: WebUISourceUpdatedEvent = {
+        id,
+        description: effective,
+        at: new Date().toISOString(),
+      };
+      for (const l of listeners) {
+        try { l(event); } catch { /* a bad listener must not break the edit */ }
+      }
+      return event;
+    },
+    on(_event, listener) {
+      listeners.add(listener);
+    },
+    off(_event, listener) {
+      listeners.delete(listener);
+    },
+  };
+}
+
+// =============================================================================
+// Config hot-reload (PR-9). The reloader owns the parse→validate→swap→rollback
+// transaction; the watcher debounces fs.watch and drives it. Reload scope =
+// connections + per-source description + approval policy. The MCP tool list is
+// NEVER reloaded (Decision D4) — it is static and registered once at startup,
+// so STDIO clients need no reconnect. All mutation is in-memory (D3): a reload
+// reseeds from the file but writes nothing back, so it can't loop the watcher.
+// =============================================================================
+
+let configReloader: ConfigReloader | null = null;
+let stopConfigWatcher: (() => void) | null = null;
+
+/**
+ * Re-resolve the boot config from disk using the same precedence chain as
+ * startup. For an explicit `--config` paired with `--ssh`/legacy CLI sources,
+ * `cliSources` is retained so only the TOML top-level policy is reloaded and
+ * the file's suppressed `[[sources]]` never replaces the CLI transports. Throws
+ * on any parse/validation error — the reloader keeps the old config.
+ */
+export function resolveReloadConfig(params: {
+  cliSources: ServerConfig[];
+  configPath: string;
+  cliArgs: Record<string, unknown>;
+  env?: NodeJS.ProcessEnv;
+}): ResolvedConfig {
+  return resolveConfig({
+    cliSources: params.cliSources,
+    cliConfigPath: params.configPath,
+    // Keep the CLI switch tri-state identical to startup: absent delegates to
+    // TOML, a bare --webui forces true, and --webui=false forces false.
+    webuiEnabled: cliSwitchOverride(params.cliArgs, 'webui'),
+    env: params.env,
+  });
+}
+
+function reloadResolveConfig(): ResolvedConfig {
+  return resolveReloadConfig({
+    cliSources: cliSourceConfigs,
+    // Pin reloads to the EXACT file the boot resolver settled on (the same file
+    // the watcher is attached to), NOT the raw `--config` flag. CONFIG_PATH is
+    // undefined for env-var (`SSH_MCP_CONFIG`) and default-discovered boots, so
+    // passing it would make the reloader RE-RUN discovery: if a higher-
+    // precedence config (e.g. an explicit `--config`-style path, or an
+    // `SSH_MCP_CONFIG` that appeared in the environment) showed up after boot,
+    // an edit to the WATCHED file could end up applying a DIFFERENT file.
+    // `resolvedConfig.configPath` is the absolute path resolved at startup;
+    // feeding it back as the highest-precedence input keeps the loader and the
+    // watcher pinned to one file for the whole process lifetime.
+    configPath: resolvedConfig.configPath!,
+    // Preserve the startup CLI override in BOTH directions so reload validation
+    // sees the same effective WebUI state as a fresh boot. Passing the parsed
+    // argv through the shared tri-state parser is load-bearing: key presence
+    // alone would misread --webui=false as enabled, while coercing an absent
+    // switch to false would suppress TOML enabled=true.
+    cliArgs: argvConfig,
+  });
+}
+
+/**
+ * Decide whether the resolved config path is an authoritative hot-reload input.
+ * TOML-driven boots always qualify. CLI-source boots qualify only when the user
+ * explicitly supplied `--config`; auto-discovered files must not become live
+ * policy inputs (or weaken CLI connection guards) merely because they exist.
+ */
+export function shouldWatchResolvedConfig(params: {
+  configPath?: string;
+  cliSourceCount: number;
+  explicitConfigPath?: string;
+}): boolean {
+  if (!params.configPath) return false;
+  return params.cliSourceCount === 0 || params.explicitConfigPath !== undefined;
+}
+
+/** Build the ConfigReloader bound to the live registry + approval engine. */
+function buildConfigReloader(): ConfigReloader | null {
+  if (!shouldWatchResolvedConfig({
+    configPath: resolvedConfig.configPath,
+    cliSourceCount: cliSourceConfigs.length,
+    explicitConfigPath,
+  })) return null;
+  return new ConfigReloader({
+    registry,
+    loadConfig: reloadResolveConfig,
+    engine: approvalEngine ?? undefined,
+    // NOTE: deliberately NO `prepareSources` hook here. Key reading stays LAZY
+    // on reload, exactly like boot: the live `registry` was constructed with
+    // `prepareKeyContents` as its per-host `prepareConfig` hook (see
+    // `new TransportRegistry(prepareKeyContents)`), which runs inside get(name)
+    // for whichever host is actually selected — and survives reloads because
+    // replaceAll() only swaps configs, never the registry instance. Eagerly
+    // running prepareKeyContents() over EVERY new source here (the old
+    // behaviour) made one source with an unreadable/unmounted ssh2 key throw
+    // mid-swap and roll back the ENTIRE reload — including edits to unrelated
+    // healthy sources — a divergence from boot, where a bad key only fails when
+    // that specific host is used. Leaving it lazy keeps reload and boot on the
+    // same failure-isolation contract (multi-host R2 hardening).
+  });
+}
+
+/** Adapt the ConfigReloader (an EventEmitter) to the WebUI's read-only controller. */
+function buildWebUIReloadController(reloader: ConfigReloader | null): WebUIConfigReloadController | undefined {
+  if (!reloader) return undefined;
+  const wrappers = new Map<Function, (e: any) => void>();
+  return {
+    on(event, listener) {
+      const wrap = (e: any) => listener(e);
+      wrappers.set(listener, wrap);
+      reloader.on(event, wrap);
+    },
+    off(event, listener) {
+      const wrap = wrappers.get(listener);
+      if (wrap) {
+        reloader.off(event, wrap);
+        wrappers.delete(listener);
+      }
+    },
+  };
+}
+
+async function maybeStartWebUI(): Promise<{ close(): Promise<void> } | undefined> {
+  if (!isWebUIActive()) return undefined;
+
+  const tomlWebui = resolvedConfig.webui;
+  const host = tomlWebui?.host ?? '127.0.0.1';
+  const port = tomlWebui?.port ?? 8088;
+  const authToken = tomlWebui?.auth_token;
+
+  const modeController = buildWebUIModeController(approvalEngine);
+  const handle = await startWebUI({
+    host,
+    port,
+    authToken,
+    cors: tomlWebui?.cors,
+    registry: { list: () => registry.list() },
+    queue: buildWebUIApprovalQueueAdapter(approvalEngine),
+    audit: buildWebUIAuditTailAdapter(auditSink),
+    getApprovalMode: makeApprovalModeLookup({ modeController }),
+    modeController,
+    sourceController: buildWebUISourceController(registry),
+    reloadController: buildWebUIReloadController(configReloader),
+  });
+  const tokenStatus = authToken ? 'token required' : 'anonymous loopback';
+  console.error(`SSH MCP WebUI running on http://${handle.address.host}:${handle.address.port}/ — ${tokenStatus}`);
+  return handle;
+}
+
+function auditExecution(params: {
+  tool: 'exec' | 'sudo-exec';
+  profile: string;
+  command: string;
+  description?: string;
+  startedAt: number;
+  result?: ExecResult;
+  error?: unknown;
+  store: { append(record: unknown): unknown };
+}): void {
+  const now = new Date();
+  const durationMs = Math.max(0, Date.now() - params.startedAt);
+  try {
+    // Append inside the try: audit logging is best-effort — a store failure
+    // must be visible but should not hide the real SSH result.
+    params.store.append({
+      profile: params.profile,
+      tool: params.tool,
+      command: params.command,
+      description: params.description,
+      approval: {
+        mode: 'yolo',
+        decision: 'allow',
+        reason: 'approval engine not yet wired (legacy direct wrapper)',
+        decided_at: now.toISOString(),
+        decided_by: 'yolo',
+      },
+      exec: params.result
+        ? {
+            stdout: params.result.stdout ?? '',
+            stderr: params.result.stderr ?? '',
+            exitCode: params.result.exitCode ?? null,
+            durationMs,
+          }
+        : {
+            stdout: '',
+            stderr: params.error instanceof Error ? params.error.message : String(params.error ?? 'unknown error'),
+            exitCode: null,
+            durationMs,
+          },
+      now,
+    });
+  } catch (auditErr: any) {
+    // Audit failure must be visible but should not hide the real SSH result.
+    console.error(`audit log append failed: ${auditErr?.message || auditErr}`);
+  }
+}
+
+export async function executeAuditedTransportCommand(input: {
+  transport: Pick<ISshTransport, 'exec' | 'execElevated'>;
+  tool: 'exec' | 'sudo-exec';
+  command: string;
+  description?: string;
+  profile?: string;
+  timeoutMs?: number;
+  sudoPassword?: string;
+  store: { append(record: unknown): unknown };
+}) {
+  const startedAt = Date.now();
+  const profile = input.profile ?? 'default';
+  let audited = false;
+  // Record the raw attempted command if sanitization rejects it below. A
+  // command rejected by validation (empty / over --maxChars) still leaves an
+  // audit record — the contract covers failures, and sanitizeCommand throws.
+  let auditCommand = String(input.command ?? '');
+  try {
+    const sanitizedCommand = sanitizeCommand(input.command);
+    const commandWithDescription = appendDescriptionComment(sanitizedCommand, input.description);
+    auditCommand = commandWithDescription;
+    const result = input.tool === 'sudo-exec'
+      ? await input.transport.execElevated(commandWithDescription, {
+          timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT,
+          mode: 'sudo',
+          password: input.sudoPassword,
+        })
+      : await input.transport.exec(commandWithDescription, { timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT });
+    // Map the result BEFORE writing the audit record: for a failed ExecResult
+    // (e.g. non-zero exit with empty stderr) `resultToMcpContent` throws the
+    // synthetic failure context ("Command exited with status N"). Auditing
+    // first would persist an empty stderr and then `audited` would suppress
+    // the catch path, leaving the wrapper's failure audits misleading and
+    // divergent from the MCP handlers (Codex 3556038517). Mirror
+    // `recordAuditResult`: audit the raw result on success, and merge the
+    // mapped execution error into stderr on failure.
+    try {
+      const response = resultToMcpContent(result);
+      auditExecution({
+        tool: input.tool,
+        profile,
+        command: commandWithDescription,
+        description: input.description,
+        startedAt,
+        result,
+        store: input.store,
+      });
+      audited = true;
+      return response;
+    } catch (mapErr) {
+      auditExecution({
+        tool: input.tool,
+        profile,
+        command: commandWithDescription,
+        description: input.description,
+        startedAt,
+        result: { ...result, stderr: stderrWithExecutionError(result.stderr, mapErr) },
+        store: input.store,
+      });
+      audited = true;
+      throw mapErr;
+    }
+  } catch (err) {
+    // Transport rejection (spawn failure, unexpected exception) OR a
+    // sanitization rejection (empty/too-long command) still gets an audit
+    // record — the contract is "audit success AND failure", matching the
+    // exec/sudo-exec MCP handlers. `audited` guards the resultToMcpContent
+    // throw path (result already audited above) from double-writing.
+    if (!audited) {
+      auditExecution({
+        tool: input.tool,
+        profile,
+        command: auditCommand,
+        description: input.description,
+        startedAt,
+        error: err,
+        store: input.store,
+      });
+    }
+    throw err;
+  }
+}
+
+/**
+ * Map ExecResult to MCP tool response. Preserves upstream semantics:
+ *   - auth/host_key/connect/transport categories → reject with descriptive error
+ *   - timeout → reject with timeout error
+ *   - non-zero exit/signal → reject with synthetic status/signal context first;
+ *     benign OpenSSH warnings are removed, then substantive stderr wins over a
+ *     stdout fallback. Whitespace/warning-only stderr therefore cannot make a
+ *     failed command look context-free.
+ *   - exit 0 → success, even if stderr is non-empty
+ *
+ * Exit 0 is treated as success regardless of stderr: the OpenSSH transport
+ * surfaces benign diagnostics on stderr (e.g. with the default
+ * StrictHostKeyChecking=accept-new, the first connection to a host prints
+ * "Warning: Permanently added '<host>' ... to the list of known hosts." while
+ * exiting 0). Throwing on any stderr would turn every first-connect into an
+ * error. On success the benign OpenSSH host-key warning is filtered out, but
+ * any remaining stderr is appended to the text response so callers do not lose
+ * useful command diagnostics/progress from tools (git clone, curl, build
+ * tools) that write to stderr while succeeding.
+ */
+/**
+ * Strip the benign OpenSSH first-connect host-key notice from a stderr stream,
+ * leaving genuine command diagnostics intact. With StrictHostKeyChecking=
+ * accept-new the client prints
+ *   "Warning: Permanently added '<host>' (<keytype>) to the list of known hosts."
+ * on the first connection to a host while still exiting 0; that line is noise,
+ * not output the caller asked for.
+ */
+function stripBenignSshWarnings(stderr: string): string {
+  return stderr
+    .split('\n')
+    .filter(line => !/^Warning: Permanently added .*to the list of known hosts\.?\s*$/.test(line))
+    .join('\n')
+    .trim();
+}
+export function resultToMcpContent(result: ExecResult) {
+  if (result.category === 'timeout') {
+    // Always surface that the command timed out, even when the process wrote to
+    // stderr before the deadline. A build/tool that prints progress or
+    // diagnostics to stderr and then hangs would otherwise be reported as an
+    // ordinary error, hiding the timeout. Keep any captured stderr as trailing
+    // context so its diagnostics are not lost.
+    const timeoutMsg = `Command execution timed out after ${DEFAULT_TIMEOUT}ms`;
+    const detail = result.stderr ? `${timeoutMsg}\n${result.stderr}` : timeoutMsg;
+    throw new McpError(ErrorCode.InternalError, detail);
+  }
+  if (result.category === 'auth') {
+    throw new McpError(ErrorCode.InternalError, `SSH authentication error: ${result.stderr}`);
+  }
+  if (result.category === 'host_key') {
+    throw new McpError(ErrorCode.InternalError, `SSH host key error: ${result.stderr}`);
+  }
+  if (result.category === 'connect') {
+    throw new McpError(ErrorCode.InternalError, `SSH connection error: ${result.stderr}`);
+  }
+  if (result.category === 'transport') {
+    throw new McpError(ErrorCode.InternalError, result.stderr || 'SSH transport error');
+  }
+  const failedExit = result.exitCode !== null && result.exitCode !== 0;
+  const signal = result.signal?.trim() || undefined;
+  if (failedExit || signal) {
+    const status = failedExit
+      ? `Command exited with status ${result.exitCode}${signal ? ` (signal ${signal})` : ''}`
+      : `Command terminated by signal ${signal}`;
+    const filteredStderr = stripBenignSshWarnings(result.stderr);
+    const stdoutFallback = result.stdout.trim();
+    const diagnostic = filteredStderr || stdoutFallback;
+    const detail = diagnostic ? `${status}\n${diagnostic}` : status;
+    const label = failedExit ? `code ${result.exitCode}` : `signal ${signal}`;
+    throw new McpError(ErrorCode.InternalError, `Error (${label}):\n${detail}`);
+  }
+  const diagnostics = stripBenignSshWarnings(result.stderr);
+  const text = diagnostics
+    ? `${result.stdout}${result.stdout && !result.stdout.endsWith('\n') ? '\n' : ''}${diagnostics}`
+    : result.stdout;
+  return {
+    content: [{
+      type: 'text' as const,
+      text,
+    }],
+  };
+}
+
+export function isFailedExecResult(result: ExecResult): boolean {
+  return result.category === 'timeout'
+    || result.category === 'auth'
+    || result.category === 'host_key'
+    || result.category === 'connect'
+    || result.category === 'transport'
+    || (result.exitCode !== null && result.exitCode !== 0)
+    || Boolean(result.signal?.trim());
+}
+
+function recordAuditResult(
+  base: Omit<Parameters<AuditSink['record']>[0], 'result' | 'error'>,
+  result: ExecResult,
+) {
+  try {
+    const response = resultToMcpContent(result);
+    auditSink.record({ ...base, result });
+    return response;
+  } catch (err) {
+    auditSink.record({ ...base, result, error: err });
+    throw err;
+  }
+}
 
 const server = new McpServer({
   name: 'SSH MCP Server',
-  version: '1.5.0',
-  capabilities: {
-    resources: {},
-    tools: {},
-  },
+  version: '2.1.0',
+  capabilities: { resources: {}, tools: {} },
 });
 
+const connectionNameSchema = z.string().optional()
+  .describe(
+    'Name of the SSH connection to target (the id/name from your --ssh=<JSON> config). ' +
+    'REQUIRED when multiple SSH connections are configured: omitting or blanking it fails fast with the list ' +
+    'of valid names instead of silently routing to the default source. Omission is allowed only for a true ' +
+    'single-source deployment (the lone source is used), or when the operator has explicitly opted out of ' +
+    'the multi-connection requirement to restore the legacy silent-default fallback.',
+  );
+
 server.tool(
-  "exec",
-  "Execute a shell command on the remote SSH server and return the output.",
+  'exec',
+  'Execute a shell command on a remote SSH server and return the output.',
   {
-    command: z.string().describe("Shell command to execute on the remote SSH server"),
-    description: z.string().optional().describe("Optional description of what this command will do"),
+    command: z.string().describe('Shell command to execute on the remote SSH server'),
+    description: z.string().optional().describe('Optional description of what this command will do'),
+    connectionName: connectionNameSchema,
   },
-  async ({ command, description }) => {
-    // Sanitize command input
-    const sanitizedCommand = sanitizeCommand(command);
-
+  async ({ command, description, connectionName }) => {
+    let commandWithDescription = String(command ?? '');
+    let profile = resolvedProfileName(connectionName);
+    let approvalMode = resolveLiveApprovalMode(profile, approvalEngine);
+    // Fallback timestamp for errors raised before the transport call (registry
+    // init failure, approval deny). Re-captured immediately before t.exec below
+    // so a SUCCESSFUL command's audit durationMs measures command runtime only,
+    // not SSH init + approval wait time.
+    let startedAt = Date.now();
+    let audited = false;
+    let approvalDecision: ApprovalDecision | undefined;
     try {
-      // Initialize connection manager if not already done
-      if (!connectionManager) {
-        if (!HOST || !USER) {
-          throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
-        }
-        const sshConfig: SSHConfig = {
-          host: HOST,
-          port: PORT,
-          username: USER,
-        };
-
-        if (PASSWORD) {
-          sshConfig.password = PASSWORD;
-        } else if (KEY) {
-          const fs = await import('fs/promises');
-          sshConfig.privateKey = await fs.readFile(KEY, 'utf8');
-        }
-
-        if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
-          sshConfig.suPassword = sanitizePassword(SUPASSWORD);
-        }
-        connectionManager = new SSHConnectionManager(sshConfig);
-      }
-
-      // Ensure connection is active (reconnect if needed)
-      await connectionManager.ensureConnected();
-
-      // If a suPassword was provided, explicitly wait for elevation before executing.
-      // This is critical: ensureElevated is idempotent and will return immediately if
-      // already elevated, so this ensures we have a su shell before we try to use it.
-      if ((connectionManager as any).getSuPassword && (connectionManager as any).getSuPassword()) {
-        try {
-          const elevationPromise = (connectionManager as any).ensureElevated();
-          // Add a short timeout for elevation to complete
-          await Promise.race([
-            elevationPromise,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Elevation timeout')), 5000))
-          ]);
-        } catch (err) {
-          // Log but don't fail; fall back to non-elevated execution if elevation times out
-        }
-      }
-
-      // Append description as comment if provided
-      const commandWithDescription = description
-        ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
-        : sanitizedCommand;
-
-      const result = await execSshCommandWithConnection(connectionManager, commandWithDescription);
-      return result;
+      const sanitizedCommand = sanitizeCommand(command);
+      commandWithDescription = appendDescriptionComment(sanitizedCommand, description);
+      const target = approvalTargetForConnection(registry, connectionName);
+      profile = target.profile;
+      approvalMode = resolveLiveApprovalMode(profile, approvalEngine);
+      const approved = await approveTransportForCurrentConfig({
+        reg: registry,
+        profile: target.approvalProfile,
+        gate: (currentProfile) => gateApproval({
+          profile: currentProfile,
+          tool: 'exec',
+          command: commandWithDescription,
+          description,
+        }),
+      });
+      const t = approved.transport;
+      profile = approved.profile;
+      approvalDecision = approved.approval;
+      startedAt = Date.now();
+      const result = await t.exec(commandWithDescription, { timeoutMs: DEFAULT_TIMEOUT });
+      audited = true;
+      const response = recordAuditResult({
+        tool: 'exec',
+        profile,
+        command: commandWithDescription,
+        description,
+        startedAt,
+        approval: approvalDecision,
+        approvalMode,
+      }, result);
+      return response;
     } catch (err: any) {
-      // Wrap unexpected errors
+      approvalDecision = approvalDecision ?? getApprovalDecisionFromError(err);
+      if (!audited) auditSink.record({
+        tool: 'exec',
+        profile,
+        command: commandWithDescription,
+        description,
+        startedAt,
+        error: err,
+        approval: approvalDecision,
+        approvalMode,
+      });
       if (err instanceof McpError) throw err;
       throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
     }
   }
 );
 
-// Expose sudo-exec tool unless explicitly disabled
 if (!DISABLE_SUDO) {
   server.tool(
-    "sudo-exec",
-    "Execute a shell command on the remote SSH server using sudo. Will use sudo password if provided, otherwise assumes passwordless sudo.",
+    'sudo-exec',
+    'Execute a shell command on a remote SSH server using sudo. Uses the configured sudoPassword if provided; otherwise assumes passwordless sudo.',
     {
-      command: z.string().describe("Shell command to execute with sudo on the remote SSH server"),
-      description: z.string().optional().describe("Optional description of what this command will do"),
+      command: z.string().describe('Shell command to execute with sudo on the remote SSH server'),
+      description: z.string().optional().describe('Optional description of what this command will do'),
+      connectionName: connectionNameSchema,
     },
-    async ({ command, description }) => {
-      const sanitizedCommand = sanitizeCommand(command);
-
+    async ({ command, description, connectionName }) => {
+      let commandWithDescription = String(command ?? '');
+      let profile = resolvedProfileName(connectionName);
+      let approvalMode = resolveLiveApprovalMode(profile, approvalEngine);
+      // Fallback timestamp for errors raised before the transport call (registry
+      // init failure, approval deny). Re-captured immediately before
+      // t.execElevated below so a SUCCESSFUL command's audit durationMs measures
+      // command runtime only, not SSH init + approval wait time.
+      let startedAt = Date.now();
+      let audited = false;
+      let approvalDecision: ApprovalDecision | undefined;
       try {
-        if (!connectionManager) {
-          if (!HOST || !USER) {
-            throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
-          }
-
-          const sshConfig: SSHConfig = {
-            host: HOST,
-            port: PORT || 22,
-            username: USER,
-          };
-          if (PASSWORD) {
-            sshConfig.password = PASSWORD;
-          } else if (KEY) {
-            const fs = await import('fs/promises');
-            sshConfig.privateKey = await fs.readFile(KEY, 'utf8');
-          }
-          if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
-            sshConfig.suPassword = sanitizePassword(SUPASSWORD);
-          }
-          if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) {
-            sshConfig.sudoPassword = sanitizePassword(SUDOPASSWORD);
-          }
-          connectionManager = new SSHConnectionManager(sshConfig);
-        }
-
-        await connectionManager.ensureConnected();
-
-        // If suPassword or sudoPassword were provided on this call but the
-        // existing connection manager was created earlier without them,
-        // update the manager's values so the subsequent sudo-exec call uses
-        // the latest passwords.
-        if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
-          await connectionManager.setSuPassword(sanitizePassword(SUPASSWORD));
-        }
-        if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) {
-          // update sudoPassword on the manager instance
-          (connectionManager as any).sshConfig = { ...(connectionManager as any).sshConfig, sudoPassword: sanitizePassword(SUDOPASSWORD) };
-        }
-
-        let wrapped: string;
-        const sudoPassword = connectionManager.getSudoPassword();
-
-        // Append description as comment if provided
-        const commandWithDescription = description
-          ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
-          : sanitizedCommand;
-
-        if (!sudoPassword) {
-          // No password provided, use -n to fail if sudo requires a password
-          wrapped = `sudo -n sh -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
-        } else {
-          // Password provided — pipe it into sudo using printf. This avoids complex
-          // PTY/stdin handling on the SSH channel and is simpler and more reliable.
-          const pwdEscaped = sudoPassword.replace(/'/g, "'\\''");
-          wrapped = `printf '%s\\n' '${pwdEscaped}' | sudo -p "" -S sh -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
-        }
-
-        return await execSshCommandWithConnection(connectionManager, wrapped);
+        const sanitizedCommand = sanitizeCommand(command);
+        commandWithDescription = appendDescriptionComment(sanitizedCommand, description);
+        const target = approvalTargetForConnection(registry, connectionName);
+        profile = target.profile;
+        approvalMode = resolveLiveApprovalMode(profile, approvalEngine);
+        const approved = await approveTransportForCurrentConfig({
+          reg: registry,
+          profile: target.approvalProfile,
+          gate: (currentProfile) => gateApproval({
+            profile: currentProfile,
+            tool: 'sudo-exec',
+            command: commandWithDescription,
+            description,
+          }),
+        });
+        const t = approved.transport;
+        profile = approved.profile;
+        approvalDecision = approved.approval;
+        // Legacy single-host mode may still pass --sudoPassword on CLI; in
+        // multi-host mode each ServerConfig carries its own sudoPassword.
+        const legacySudo = (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined && !isMultiHost)
+          ? sanitizePassword(SUDOPASSWORD)
+          : undefined;
+        startedAt = Date.now();
+        const result = await t.execElevated(commandWithDescription, {
+          timeoutMs: DEFAULT_TIMEOUT,
+          mode: 'sudo',
+          password: legacySudo,
+        });
+        audited = true;
+        const response = recordAuditResult({
+          tool: 'sudo-exec',
+          profile,
+          command: commandWithDescription,
+          description,
+          startedAt,
+          approval: approvalDecision,
+          approvalMode,
+        }, result);
+        return response;
       } catch (err: any) {
+        approvalDecision = approvalDecision ?? getApprovalDecisionFromError(err);
+        if (!audited) auditSink.record({
+          tool: 'sudo-exec',
+          profile,
+          command: commandWithDescription,
+          description,
+          startedAt,
+          error: err,
+          approval: approvalDecision,
+          approvalMode,
+        });
         if (err instanceof McpError) throw err;
         throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
       }
@@ -496,16 +1832,40 @@ if (!DISABLE_SUDO) {
   );
 }
 
-// New function that uses persistent connection
-export async function execSshCommandWithConnection(manager: SSHConnectionManager, command: string, stdin?: string): Promise<{ [x: string]: unknown; content: ({ [x: string]: unknown; type: "text"; text: string; } | { [x: string]: unknown; type: "image"; data: string; mimeType: string; } | { [x: string]: unknown; type: "audio"; data: string; mimeType: string; } | { [x: string]: unknown; type: "resource"; resource: any; })[] }> {
+server.tool(
+  'list-servers',
+  'List all configured SSH server connections, their auth mode, and current connection status.',
+  {},
+  async () => {
+    const rows = registry.list();
+    if (rows.length === 0) {
+      return { content: [{ type: 'text', text: 'No SSH servers are configured.' }] };
+    }
+    const text = rows.map(r => {
+      const tag = r.isDefault ? ' (default)' : '';
+      const state = r.connected ? 'connected' : 'not yet connected';
+      return `- ${r.name}${tag}: ${r.username}@${r.host}:${r.port} [transport=${r.transport}, auth=${r.authMode}, ${state}]`;
+    }).join('\n');
+    return { content: [{ type: 'text', text }] };
+  }
+);
+
+// =============================================================================
+// Legacy exports preserved for existing test files.
+// =============================================================================
+
+export async function execSshCommandWithConnection(
+  manager: SSHConnectionManager,
+  command: string,
+  stdin?: string
+): Promise<{ [x: string]: unknown; content: ({ [x: string]: unknown; type: 'text'; text: string; } | { [x: string]: unknown; type: 'image'; data: string; mimeType: string; } | { [x: string]: unknown; type: 'audio'; data: string; mimeType: string; } | { [x: string]: unknown; type: 'resource'; resource: any; })[] }> {
   return new Promise((resolve, reject) => {
     let timeoutId: NodeJS.Timeout;
     let isResolved = false;
 
     const conn = manager.getConnection();
-    const shell = (manager as any).suShell;  // Use su shell if available
+    const shell = (manager as any).getSuShell ? (manager as any).getSuShell() : (manager as any).suShell;
 
-    // Set up timeout
     timeoutId = setTimeout(() => {
       if (!isResolved) {
         isResolved = true;
@@ -513,44 +1873,29 @@ export async function execSshCommandWithConnection(manager: SSHConnectionManager
       }
     }, DEFAULT_TIMEOUT);
 
-    // If we have an active su shell, use it directly (commands run as root in session)
     if (shell) {
       let buffer = '';
-
       const dataHandler = (data: Buffer) => {
         const text = data.toString();
         buffer += text;
-
-        // Wait for root prompt (#) to know command is complete
-        // Match # which indicates root prompt (may be followed by spaces, escape codes, etc)
         if (/#/.test(buffer)) {
           if (!isResolved) {
             isResolved = true;
             clearTimeout(timeoutId);
-
-            // Extract output: remove the command echo and final prompt
             const lines = buffer.split('\n');
-            // First line is often the echoed command; last line is the prompt
-            let output = lines.slice(1, -1).join('\n');
-
+            const output = lines.slice(1, -1).join('\n');
             resolve({
-              content: [{
-                type: 'text',
-                text: output + (output ? '\n' : ''),
-              }],
+              content: [{ type: 'text', text: output + (output ? '\n' : '') }],
             });
           }
           shell.removeListener('data', dataHandler);
         }
       };
-
       shell.on('data', dataHandler);
-      // Send command immediately; shell is ready after elevation
       shell.write(command + '\n');
       return;
     }
 
-    // No persistent su shell; use normal exec with optional password piping
     conn.exec(command, (err: Error | undefined, stream: ClientChannel) => {
       if (err) {
         if (!isResolved) {
@@ -564,37 +1909,21 @@ export async function execSshCommandWithConnection(manager: SSHConnectionManager
       let stdout = '';
       let stderr = '';
 
-      // If stdin provided (e.g., sudo password), write it
       if (stdin && stdin.length > 0) {
-        try {
-          stream.write(stdin);
-        } catch (e) {
-          console.error('Error writing to stdin:', e);
-        }
+        try { stream.write(stdin); } catch (e) { console.error('Error writing to stdin:', e); }
       }
       try { stream.end(); } catch (e) { /* ignore */ }
 
-      stream.on('data', (data: Buffer) => {
-        stdout += data.toString();
-      });
-
-      stream.stderr.on('data', (data: Buffer) => {
-        stderr += data.toString();
-      });
-
-      stream.on('close', (code: number, signal: string) => {
+      stream.on('data', (data: Buffer) => { stdout += data.toString(); });
+      stream.stderr.on('data', (data: Buffer) => { stderr += data.toString(); });
+      stream.on('close', (code: number, _signal: string) => {
         if (!isResolved) {
           isResolved = true;
           clearTimeout(timeoutId);
           if (stderr) {
             reject(new McpError(ErrorCode.InternalError, `Error (code ${code}):\n${stderr}`));
           } else {
-            resolve({
-              content: [{
-                type: 'text',
-                text: stdout,
-              }],
-            });
+            resolve({ content: [{ type: 'text', text: stdout }] });
           }
         }
       });
@@ -602,24 +1931,21 @@ export async function execSshCommandWithConnection(manager: SSHConnectionManager
   });
 }
 
-// Keep the old function for backward compatibility (used in tests)
-export async function execSshCommand(sshConfig: any, command: string, stdin?: string): Promise<{ [x: string]: unknown; content: ({ [x: string]: unknown; type: "text"; text: string; } | { [x: string]: unknown; type: "image"; data: string; mimeType: string; } | { [x: string]: unknown; type: "audio"; data: string; mimeType: string; } | { [x: string]: unknown; type: "resource"; resource: any; })[] }> {
+export async function execSshCommand(
+  sshConfig: any,
+  command: string,
+  stdin?: string
+): Promise<{ [x: string]: unknown; content: ({ [x: string]: unknown; type: 'text'; text: string; } | { [x: string]: unknown; type: 'image'; data: string; mimeType: string; } | { [x: string]: unknown; type: 'audio'; data: string; mimeType: string; } | { [x: string]: unknown; type: 'resource'; resource: any; })[] }> {
   return new Promise((resolve, reject) => {
     const conn = new Client();
     let timeoutId: NodeJS.Timeout;
     let isResolved = false;
 
-    // Set up timeout
     timeoutId = setTimeout(() => {
       if (!isResolved) {
         isResolved = true;
-        // Try to abort the running command before closing connection
-        const abortTimeout = setTimeout(() => {
-          // If abort command itself times out, force close connection
-          conn.end();
-        }, 5000); // 5 second timeout for abort command
-
-        conn.exec('timeout 3s pkill -f \'' + escapeCommandForShell(command) + '\' 2>/dev/null || true', (err: Error | undefined, abortStream: ClientChannel | undefined) => {
+        const abortTimeout = setTimeout(() => { conn.end(); }, 5000);
+        conn.exec(`timeout 3s pkill -f '${escapeCommandForShell(command)}' 2>/dev/null || true`, (err: Error | undefined, abortStream: ClientChannel | undefined) => {
           if (abortStream) {
             abortStream.on('close', () => {
               clearTimeout(abortTimeout);
@@ -645,18 +1971,13 @@ export async function execSshCommand(sshConfig: any, command: string, stdin?: st
           conn.end();
           return;
         }
-        // If stdin provided, write it to the stream and end stdin
         if (stdin && stdin.length > 0) {
-          try {
-            stream.write(stdin);
-          } catch (e) {
-            // ignore
-          }
+          try { stream.write(stdin); } catch (e) { /* ignore */ }
         }
         try { stream.end(); } catch (e) { /* ignore */ }
         let stdout = '';
         let stderr = '';
-        stream.on('close', (code: number, signal: string) => {
+        stream.on('close', (code: number, _signal: string) => {
           if (!isResolved) {
             isResolved = true;
             clearTimeout(timeoutId);
@@ -664,21 +1985,12 @@ export async function execSshCommand(sshConfig: any, command: string, stdin?: st
             if (stderr) {
               reject(new McpError(ErrorCode.InternalError, `Error (code ${code}):\n${stderr}`));
             } else {
-              resolve({
-                content: [{
-                  type: 'text',
-                  text: stdout,
-                }],
-              });
+              resolve({ content: [{ type: 'text', text: stdout }] });
             }
           }
         });
-        stream.on('data', (data: Buffer) => {
-          stdout += data.toString();
-        });
-        stream.stderr.on('data', (data: Buffer) => {
-          stderr += data.toString();
-        });
+        stream.on('data', (data: Buffer) => { stdout += data.toString(); });
+        stream.stderr.on('data', (data: Buffer) => { stderr += data.toString(); });
       });
     });
     conn.on('error', (err: Error) => {
@@ -692,45 +2004,64 @@ export async function execSshCommand(sshConfig: any, command: string, stdin?: st
   });
 }
 
+// =============================================================================
+// Server lifecycle
+// =============================================================================
+
 async function main() {
+  await bootstrapRegistry();
+  // Boot the approval engine + optional audit seam BEFORE the MCP transport so
+  // the very first exec / sudo-exec call is gated and (optionally) audited.
+  await wireApprovalAndAudit();
+  // Build the config reloader AFTER the approval engine exists so a hot reload
+  // reseeds policy in lockstep with connections. CLI/`--ssh` boots participate
+  // only when paired with an explicit --config policy file.
+  configReloader = buildConfigReloader();
+  const webuiHandle = await maybeStartWebUI();
+  // Start the debounced TOML watcher LAST so the WebUI's reloadController is
+  // already subscribed before any file change can fire `config-reloaded`.
+  if (configReloader && resolvedConfig.configPath) {
+    stopConfigWatcher = startConfigWatcher({
+      configPath: resolvedConfig.configPath,
+      onChange: async () => { await configReloader!.reload(); },
+    });
+  }
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("SSH MCP Server running on stdio");
+  const mode = isMultiHost ? `multi-host (${registry.names().length} servers: ${registry.names().join(', ')})` : 'single-host';
+  console.error(`SSH MCP Server running on stdio — ${mode}`);
 
-  // Handle graceful shutdown
   const cleanup = () => {
-    console.error("Shutting down SSH MCP Server...");
-    if (connectionManager) {
-      connectionManager.close();
-      connectionManager = null;
-    }
+    console.error('Shutting down SSH MCP Server...');
+    if (stopConfigWatcher) { try { stopConfigWatcher(); } catch { /* ignore */ } }
+    if (webuiHandle) void webuiHandle.close().catch(() => { /* ignore */ });
+    void registry.closeAll();
     process.exit(0);
   };
 
   process.on('SIGINT', cleanup);
   process.on('SIGTERM', cleanup);
-  process.on('exit', () => {
-    if (connectionManager) {
-      connectionManager.close();
-    }
-  });
+  process.on('exit', () => { void registry.closeAll(); });
 }
 
-// Initialize server in test mode for automated tests
 if (isTestMode) {
-  const transport = new StdioServerTransport();
-  server.connect(transport).catch(error => {
-    console.error("Fatal error connecting server:", error);
-    process.exit(1);
-  });
-}
-// Start server in CLI mode
-else if (isCliEnabled) {
+  (async () => {
+    try {
+      await bootstrapRegistry();
+    } catch { /* tests may not configure hosts */ }
+    try {
+      await wireApprovalAndAudit();
+    } catch { /* tests may not configure an approval engine */ }
+    const transport = new StdioServerTransport();
+    server.connect(transport).catch(error => {
+      console.error('Fatal error connecting server:', error);
+      process.exit(1);
+    });
+  })();
+} else if (isCliEnabled) {
   main().catch((error) => {
-    console.error("Fatal error in main():", error);
-    if (connectionManager) {
-      connectionManager.close();
-    }
+    console.error('Fatal error in main():', error);
+    void registry.closeAll();
     process.exit(1);
   });
 }
