@@ -330,16 +330,18 @@ export class OpenSshTransport implements ISshTransport {
     return new Promise((resolve) => {
       const nonce = randomBytes(8).toString('hex');
       const endMark = `__SSH_MCP_END_${nonce}__`;
-      // Keep the user command in a subshell so `exit`/`exec` cannot prevent the
-      // sentinel. The leading newline in printf is an artificial separator;
-      // parsing removes exactly that byte and therefore preserves unterminated
-      // stdout. A random marker distinguishes the remote command's status 255
-      // from ssh(1)'s own transport/auth failure status 255.
-      const wrappedCommand = `(
-${command}
-)
-__ssh_mcp_rc=$?
-printf '\n${endMark}%s\n' "$__ssh_mcp_rc"
+      // Run the user text as data for an inner POSIX shell. Embedding it raw in
+      // the outer sentinel script lets an unmatched quote/comment become an
+      // OUTER parse error, preventing the sentinel from running and
+      // misclassifying a user syntax error as a transport failure. Canonical
+      // single-quote escaping keeps the outer script parseable; exit/exec and
+      // syntax errors are contained in the inner shell. The leading newline in
+      // printf remains an artificial separator so parsing preserves an
+      // unterminated final stdout byte.
+      const escapedCommand = command.replace(/'/g, "'\\''");
+      const wrappedCommand = `sh -c '${escapedCommand}'
+__ssh_mcp_status=$?
+printf '\n${endMark}%s\n' "$__ssh_mcp_status"
 exit 0`;
       const args = [...this.buildArgs(opts), wrappedCommand];
       let timedOut = false;
