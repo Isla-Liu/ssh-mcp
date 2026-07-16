@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { McpError } from '@modelcontextprotocol/sdk/types.js';
-import { resultToMcpContent } from '../src/index';
+import { isFailedExecResult, resultToMcpContent } from '../src/index';
 import type { ExecResult } from '../src/transports/types';
 
 // Regression: previously any non-empty stderr threw "Error (code 0):" even when
@@ -10,6 +10,16 @@ import type { ExecResult } from '../src/transports/types';
 
 describe('resultToMcpContent', () => {
   const baseOk: ExecResult = { stdout: '', stderr: '', exitCode: 0 };
+
+  function failureMessage(result: ExecResult): string {
+    try {
+      resultToMcpContent(result);
+    } catch (err) {
+      expect(err).toBeInstanceOf(McpError);
+      return (err as McpError).message;
+    }
+    throw new Error('expected resultToMcpContent to throw');
+  }
 
   it('returns stdout on plain success', () => {
     const r = resultToMcpContent({ ...baseOk, stdout: 'hello\n' });
@@ -55,6 +65,63 @@ describe('resultToMcpContent', () => {
       stderr: 'permission denied\n',
       exitCode: 1,
     })).toThrow(McpError);
+  });
+
+  it('keeps exit status context when stderr is whitespace-only', () => {
+    const message = failureMessage({ stdout: '', stderr: ' \r\n\t', exitCode: 7 });
+    expect(message).toContain('Command exited with status 7');
+  });
+
+  it('filters a warning-only stderr stream without hiding the non-zero exit status', () => {
+    const message = failureMessage({
+      stdout: '',
+      stderr: "Warning: Permanently added 'host' (ED25519) to the list of known hosts.\n",
+      exitCode: 23,
+    });
+    expect(message).toContain('Command exited with status 23');
+    expect(message).not.toContain('Permanently added');
+  });
+
+  it('puts exit status first, then substantive filtered stderr, and omits warning noise', () => {
+    const message = failureMessage({
+      stdout: 'stdout fallback must not outrank stderr',
+      stderr: "Warning: Permanently added 'host' (ED25519) to the list of known hosts.\nreal stderr detail\n",
+      exitCode: 9,
+    });
+    expect(message).toMatch(/Command exited with status 9\nreal stderr detail/);
+    expect(message).not.toContain('Permanently added');
+    expect(message).not.toContain('stdout fallback');
+  });
+
+  it('uses substantive stdout after status when filtered stderr has no diagnostic', () => {
+    const message = failureMessage({
+      stdout: 'command printed failure context on stdout\n',
+      stderr: '\n',
+      exitCode: 4,
+    });
+    expect(message).toMatch(/Command exited with status 4\ncommand printed failure context on stdout/);
+  });
+
+  it('reports signal-only termination as failure and retains diagnostics', () => {
+    const result: ExecResult = {
+      stdout: '',
+      stderr: 'terminated during cleanup\n',
+      exitCode: null,
+      signal: 'SIGTERM',
+    };
+    const message = failureMessage(result);
+    expect(message).toMatch(/Command terminated by signal SIGTERM\nterminated during cleanup/);
+    expect(isFailedExecResult(result)).toBe(true);
+  });
+
+  it('reports both status and signal when a transport supplies both', () => {
+    const message = failureMessage({
+      stdout: '',
+      stderr: '',
+      exitCode: 143,
+      signal: 'SIGTERM',
+    });
+    expect(message).toContain('Command exited with status 143 (signal SIGTERM)');
   });
 
   it('treats null exitCode as 0 (legacy ssh2 close without code)', () => {
