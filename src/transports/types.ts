@@ -20,7 +20,7 @@ export type ErrorCategory =
 export interface ExecOptions {
   /** Hard ceiling; transport must enforce and return category='timeout' on breach. */
   timeoutMs: number;
-  /** Piped into remote stdin (e.g. sudo password). */
+  /** Piped into remote command stdin (the OpenSSH sudo wrapper frames credentials separately). */
   stdin?: string;
   /** Request TTY allocation (needed for su -tt flow). */
   pty?: boolean;
@@ -30,7 +30,7 @@ export type ElevationMode = 'sudo' | 'su';
 
 export interface ExecElevatedOptions extends ExecOptions {
   mode: ElevationMode;
-  /** sudo -S stdin password, or su password. Optional for passwordless sudo. */
+  /** sudo askpass credential, or su password. Optional for passwordless sudo. */
   password?: string;
 }
 
