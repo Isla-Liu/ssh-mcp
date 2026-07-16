@@ -1,4 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import {
   buildOpenSshSudoWrapper,
   classifyError,
@@ -253,11 +257,105 @@ describe('buildOpenSshSudoWrapper (Codex P1: keep sudo password out of local ssh
     expect(buildOpenSshSudoWrapper('id -u', false)).toBe("sudo -n sh -c 'id -u'");
   });
 
-  it('builds a sudo -S command but never embeds the password value', () => {
+  it('builds a sudo askpass command but never embeds the password value', () => {
     const cmd = buildOpenSshSudoWrapper("printf '%s' ok", true);
-    expect(cmd).toContain('sudo -p "" -S');
+    expect(cmd).toContain('sudo -A -p ""');
+    expect(cmd).toContain('SUDO_ASKPASS');
+    expect(cmd).not.toContain('sudo -p "" -S');
     expect(cmd).toContain("sh -c 'printf '\\''%s'\\'' ok'");
     expect(cmd).not.toContain('sudopw');
+  });
+});
+
+describe.skipIf(process.platform === 'win32')('OpenSSH sudo stdin framing', () => {
+  function exerciseWrapper(params: {
+    command: string;
+    expectsPassword: boolean;
+    sudoConsumesPassword: boolean;
+    payload: Buffer;
+  }): { stdout: Buffer; askpassCalled: boolean; wrapper: string } {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'ssh-mcp-fake-sudo-'));
+    const fakeSudo = path.join(dir, 'sudo');
+    const askpassMarker = path.join(dir, 'askpass-called');
+    const password = 'unit-sudo-password';
+    const fakeSudoScript = `#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -A|-n) shift ;;
+    -p) shift; [ "$#" -gt 0 ] || exit 90; shift ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+if [ "\${FAKE_SUDO_CONSUMES_PASSWORD:-0}" = 1 ]; then
+  [ -n "\${SUDO_ASKPASS:-}" ] || exit 91
+  __fake_password=$("$SUDO_ASKPASS")
+  [ "$__fake_password" = "$FAKE_EXPECTED_PASSWORD" ] || exit 92
+  : > "$FAKE_SUDO_MARKER"
+fi
+exec "$@"
+`;
+    writeFileSync(fakeSudo, fakeSudoScript, { mode: 0o700 });
+    chmodSync(fakeSudo, 0o700);
+
+    const wrapper = buildOpenSshSudoWrapper(params.command, params.expectsPassword);
+    const input = params.expectsPassword
+      ? Buffer.concat([Buffer.from(`${password}\n`, 'utf8'), params.payload])
+      : params.payload;
+    try {
+      const stdout = execFileSync('/bin/sh', ['-c', wrapper], {
+        input,
+        env: {
+          ...process.env,
+          PATH: `${dir}:${process.env.PATH ?? ''}`,
+          FAKE_SUDO_CONSUMES_PASSWORD: params.sudoConsumesPassword ? '1' : '0',
+          FAKE_EXPECTED_PASSWORD: password,
+          FAKE_SUDO_MARKER: askpassMarker,
+        },
+      });
+      return { stdout, askpassCalled: existsSync(askpassMarker), wrapper };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('preserves payload bytes when NOPASSWD/cached sudo does not consume a password', () => {
+    const payload = Buffer.from([0x00, 0x0a, 0x41, 0xff, 0x0a, 0x42]);
+    const result = exerciseWrapper({
+      command: 'cat',
+      expectsPassword: true,
+      sudoConsumesPassword: false,
+      payload,
+    });
+    expect(result.stdout).toEqual(payload);
+    expect(result.askpassCalled).toBe(false);
+    expect(result.wrapper).not.toContain('unit-sudo-password');
+  });
+
+  it('supplies the password only through askpass when sudo requests it and preserves wrapped stdin', () => {
+    const payload = Buffer.from('first line\nsecond line without terminator', 'utf8');
+    const result = exerciseWrapper({
+      command: "printf '%s' 'wrapped:'; cat",
+      expectsPassword: true,
+      sudoConsumesPassword: true,
+      payload,
+    });
+    expect(result.stdout).toEqual(Buffer.concat([Buffer.from('wrapped:'), payload]));
+    expect(result.askpassCalled).toBe(true);
+    expect(result.wrapper).not.toContain('unit-sudo-password');
+  });
+
+  it('passes stdin through byte-for-byte on the no-password sudo path', () => {
+    const payload = Buffer.from([0x0a, 0x00, 0x7f, 0x43]);
+    const result = exerciseWrapper({
+      command: 'cat',
+      expectsPassword: false,
+      sudoConsumesPassword: false,
+      payload,
+    });
+    expect(result.stdout).toEqual(payload);
+    expect(result.askpassCalled).toBe(false);
   });
 });
 
@@ -281,15 +379,15 @@ describe('OpenSshTransport.execElevated sudo mode (finding 6: route via su when 
     expect(runSsh).not.toHaveBeenCalled();
   });
 
-  it('uses a stdin-fed sudo wrapper when a sudo password is available (password never in argv)', async () => {
+  it('uses an askpass sudo wrapper when a sudo password is available (password never in argv)', async () => {
     const { t, runSuViaPty, runSsh } = makeTransport({ suPassword: 'supw', sudoPassword: 'sudopw' });
-    await t.execElevated('whoami', { timeoutMs: 60000, mode: 'sudo' });
+    await t.execElevated('whoami', { timeoutMs: 60000, mode: 'sudo', stdin: 'payload\n' });
     expect(runSsh).toHaveBeenCalledTimes(1);
     expect(runSuViaPty).not.toHaveBeenCalled();
     const [wrapped, runOpts] = runSsh.mock.calls[0];
-    expect(wrapped).toContain('sudo -p "" -S');
+    expect(wrapped).toContain('sudo -A -p ""');
     expect(wrapped).not.toContain('sudopw');
-    expect(runOpts.stdin).toBe('sudopw\n');
+    expect(runOpts.stdin).toBe('sudopw\npayload\n');
   });
 
   it('uses the normal sudo wrapper (passwordless) when neither su nor sudo password is set', async () => {
@@ -308,7 +406,7 @@ describe('OpenSshTransport.execElevated sudo mode (finding 6: route via su when 
     expect(runSsh).toHaveBeenCalledTimes(1);
     expect(runSuViaPty).not.toHaveBeenCalled();
     const [wrapped, runOpts] = runSsh.mock.calls[0];
-    expect(wrapped).toContain('sudo -p "" -S');
+    expect(wrapped).toContain('sudo -A -p ""');
     expect(wrapped).not.toContain('callpw');
     expect(runOpts.stdin).toBe('callpw\n');
   });

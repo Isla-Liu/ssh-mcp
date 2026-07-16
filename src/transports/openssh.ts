@@ -141,7 +141,9 @@ export class OpenSshTransport implements ISshTransport {
         // OpenSSH receives the remote command as a local ssh argv element.
         // Embedding the sudo password in that command (the ssh2 wrapper style)
         // exposes it to local process inspection. Keep argv password-free and
-        // feed sudo -S via stdin instead.
+        // frame it on stdin for a remote askpass helper instead. The wrapper
+        // consumes the password frame before the elevated command starts, so
+        // NOPASSWD/cached sudo cannot leak it into the command's stdin.
         const wrapped = buildOpenSshSudoWrapper(command, true);
         const r = await this.runSsh(wrapped, {
           ...opts,
@@ -672,13 +674,32 @@ echo ${endMark}$?`;
  *
  * Unlike the ssh2 wrapper, this must never embed the sudo password in the
  * command string: OpenSSH receives the remote command as a local `ssh` argv
- * element. When a password is needed, the caller supplies it through stdin for
- * `sudo -S` instead.
+ * element. The caller frames password + payload on SSH stdin. This wrapper
+ * consumes only the password line into a mode-0600 temporary file and exposes a
+ * mode-0700 SUDO_ASKPASS helper. sudo invokes that helper only when it actually
+ * needs a password; the wrapped command inherits the untouched remaining stdin
+ * bytes in both password-consuming and NOPASSWD/cached paths.
  */
 export function buildOpenSshSudoWrapper(command: string, expectsPassword: boolean): string {
   const escaped = command.replace(/'/g, "'\\''");
   if (expectsPassword) {
-    return `sudo -p "" -S sh -c '${escaped}'`;
+    return [
+      'umask 077',
+      '__ssh_mcp_sudo_dir=$(mktemp -d "${TMPDIR:-/tmp}/ssh-mcp-sudo.XXXXXX") || exit 1',
+      'chmod 700 "$__ssh_mcp_sudo_dir" || exit 1',
+      'trap \'rm -f "$__ssh_mcp_sudo_dir/password" "$__ssh_mcp_sudo_dir/askpass"; rmdir "$__ssh_mcp_sudo_dir"\' 0 1 2 15',
+      'IFS= read -r __ssh_mcp_sudo_password || __ssh_mcp_sudo_password=\'\'',
+      'printf \'%s\\n\' "$__ssh_mcp_sudo_password" > "$__ssh_mcp_sudo_dir/password" || exit 1',
+      'unset __ssh_mcp_sudo_password',
+      'printf \'%s\\n\' \'#!/bin/sh\' \'cat -- "${0%/*}/password"\' > "$__ssh_mcp_sudo_dir/askpass" || exit 1',
+      'chmod 700 "$__ssh_mcp_sudo_dir/askpass" || exit 1',
+      `SUDO_ASKPASS="$__ssh_mcp_sudo_dir/askpass" sudo -A -p "" sh -c '${escaped}'`,
+      '__ssh_mcp_sudo_rc=$?',
+      'rm -f "$__ssh_mcp_sudo_dir/password" "$__ssh_mcp_sudo_dir/askpass"',
+      'rmdir "$__ssh_mcp_sudo_dir"',
+      'trap - 0 1 2 15',
+      'exit "$__ssh_mcp_sudo_rc"',
+    ].join('\n');
   }
   return `sudo -n sh -c '${escaped}'`;
 }
