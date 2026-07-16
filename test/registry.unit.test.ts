@@ -248,6 +248,48 @@ describe('TransportRegistry.get (finding 1: rejected init must not be cached)', 
     expect(init).toHaveBeenCalledTimes(1);
   });
 
+  it('re-runs lazy key preparation when a cached ssh2 transport is disconnected', async () => {
+    let connected = true;
+    const first = makeStub(vi.fn().mockResolvedValue(undefined));
+    first.isConnected = vi.fn(() => connected);
+    const second = makeStub(vi.fn().mockResolvedValue(undefined));
+    second.isConnected = vi.fn(() => true);
+    const preparedKeys = ['KEY-V1', 'KEY-V2'];
+    const prepare = vi.fn(async (cfg: ServerConfig) => {
+      cfg.privateKey = preparedKeys.shift();
+      cfg.privateKeyDerivedFromKeyPath = true;
+    });
+    const constructedKeys: Array<string | undefined> = [];
+    createTransportMock
+      .mockImplementationOnce((cfg: ServerConfig) => { constructedKeys.push(cfg.privateKey); return first; })
+      .mockImplementationOnce((cfg: ServerConfig) => { constructedKeys.push(cfg.privateKey); return second; });
+
+    const r = new TransportRegistry(prepare);
+    r.register({ ...makeConfig('keyed'), authMode: 'key', password: undefined, keyPath: '/keys/id_ed25519' });
+    await expect(r.get('keyed')).resolves.toBe(first);
+
+    connected = false;
+    await expect(r.get('keyed')).resolves.toBe(second);
+    expect(first.close).toHaveBeenCalledTimes(1);
+    expect(prepare).toHaveBeenCalledTimes(2);
+    expect(constructedKeys).toEqual(['KEY-V1', 'KEY-V2']);
+  });
+
+  it('does not rebuild initialized OpenSSH transports merely because no session is live yet', async () => {
+    const openssh = makeStub(vi.fn().mockResolvedValue(undefined));
+    Object.defineProperty(openssh, 'name', { value: 'openssh' });
+    openssh.isConnected = vi.fn(() => false);
+    const prepare = vi.fn(async () => {});
+    createTransportMock.mockReturnValue(openssh);
+
+    const r = new TransportRegistry(prepare);
+    r.register({ ...makeConfig('posix'), transport: 'openssh' });
+    await expect(r.get('posix')).resolves.toBe(openssh);
+    await expect(r.get('posix')).resolves.toBe(openssh);
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(createTransportMock).toHaveBeenCalledTimes(1);
+  });
+
   // finding: per-host key reads must be deferred to get(name), not run at
   // register()/bootstrap time, so a missing key on one host cannot break
   // startup or list-servers for the other healthy hosts.
