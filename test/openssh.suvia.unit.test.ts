@@ -151,6 +151,19 @@ describe('OpenSSH command sentinels', () => {
     expect(t.isConnected()).toBe(false);
   });
 
+  it('does not treat a zero ssh-process exit without the sentinel as a usable session', async () => {
+    const fc = new FakeChild();
+    spawnMock.mockReturnValue(fc);
+    const t = new OpenSshTransport({ host: 'h', port: 22, username: 'u' });
+    const p = t.exec('true', { timeoutMs: 60000 });
+
+    fc.emit('exit', 0, null);
+    fc.emit('close', 0, null);
+
+    await expect(p).resolves.toMatchObject({ exitCode: 0, category: 'transport' });
+    expect(t.isConnected()).toBe(false);
+  });
+
   it.each(['error-before-close', 'close-before-error'] as const)(
     'settles a spawn-error lifecycle deterministically when events arrive %s',
     async (ordering) => {
