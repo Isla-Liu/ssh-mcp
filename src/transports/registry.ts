@@ -328,9 +328,11 @@ export class TransportRegistry {
         // If the config changed while prepareConfig()/init() was in flight, the
         // error belongs to an obsolete source/params set. Retry against the
         // CURRENT registry instead of surfacing a stale key-read/connect error.
+        // Preserve the caller's original selector (including undefined) so a
+        // changed default/require_connection policy is re-applied after reload.
         if (this.reloadGeneration !== gen) {
           await t?.close().catch(() => { /* best effort */ });
-          return this.get(resolved);
+          return this.get(name);
         }
         throw initError;
       }
@@ -342,10 +344,12 @@ export class TransportRegistry {
       // config; caching it would resurrect a stale connection for `resolved`
       // after closeAll already cleared the map. Discard it and re-resolve
       // against the CURRENT config so the caller gets a transport built from
-      // the new parameters (or a clear error if `resolved` was removed).
+      // the new parameters. Preserve the original selector: an omitted name
+      // must follow the current default/guard rather than become an explicit
+      // request for the source that happened to be default before the reload.
       if (this.reloadGeneration !== gen) {
         await t.close().catch(() => { /* best effort */ });
-        return this.get(resolved);
+        return this.get(name);
       }
       // Cache the live transport only on successful, still-current init.
       this.transports.set(resolved, t);

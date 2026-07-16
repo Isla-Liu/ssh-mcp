@@ -419,29 +419,34 @@ describe('TransportRegistry.get (finding 1: stale in-flight init must not surviv
     expect(r.list().map((x) => x.name)).toEqual(['beta']);
   });
 
-  it('pins an omitted name to its originally resolved source across a reload', async () => {
+  it('re-resolves an omitted name to a new explicit default after a reload', async () => {
     let resolveOldInit: () => void = () => {};
     const oldInit = vi.fn<() => Promise<void>>().mockImplementation(
       () => new Promise<void>((res) => { resolveOldInit = res; }),
     );
     const oldStub = makeStub(oldInit);
     oldStub.close = vi.fn().mockResolvedValue(undefined);
+    const staleAlphaStub = makeStub(vi.fn().mockResolvedValue(undefined));
     const newDefaultStub = makeStub(vi.fn().mockResolvedValue(undefined));
-    createTransportMock.mockReturnValueOnce(oldStub).mockReturnValue(newDefaultStub);
+    createTransportMock
+      .mockReturnValueOnce(oldStub)
+      .mockImplementation((cfg: ServerConfig) => cfg.name === 'beta' ? newDefaultStub : staleAlphaStub);
 
     const r = new TransportRegistry();
     r.register(makeConfig('alpha'));
 
-    // Omitted name resolves to alpha at request start. A reload must not let the
-    // recursive retry reinterpret that omission as the new default, beta.
+    // The caller omitted connectionName. While alpha is initializing, a reload
+    // keeps alpha registered but makes beta the explicit default. The retry must
+    // preserve that omission and run resolveName() against the current registry,
+    // not turn the old resolved alpha into a newly-explicit request.
     const inflight = r.get();
-    r.replaceAll([makeConfig('beta')]);
-    await r.closeAll();
+    r.replaceAll([makeConfig('alpha'), makeConfig('beta')], 'beta');
     resolveOldInit();
 
-    await expect(inflight).rejects.toThrow(/Unknown connection name: alpha/);
+    await expect(inflight).resolves.toBe(newDefaultStub);
     expect(oldStub.close).toHaveBeenCalledTimes(1);
-    expect(createTransportMock).toHaveBeenCalledTimes(1);
+    expect(createTransportMock).toHaveBeenCalledTimes(2);
+    expect(staleAlphaStub.init).not.toHaveBeenCalled();
   });
 
   it('retries the current config when a stale in-flight init REJECTS after a reload', async () => {
@@ -466,6 +471,34 @@ describe('TransportRegistry.get (finding 1: stale in-flight init must not surviv
     expect(oldStub.close).toHaveBeenCalledTimes(1);
     expect(createTransportMock).toHaveBeenCalledTimes(2);
     expect(r.list().find((x) => x.name === 'alpha')!.connected).toBe(true);
+  });
+
+  it('re-applies the omitted-name guard when a stale in-flight init rejects after reload', async () => {
+    let rejectOldInit: (err: Error) => void = () => {};
+    const oldInit = vi.fn<() => Promise<void>>().mockImplementation(
+      () => new Promise<void>((_res, rej) => { rejectOldInit = rej; }),
+    );
+    const oldStub = makeStub(oldInit);
+    oldStub.close = vi.fn().mockResolvedValue(undefined);
+    const staleAlphaStub = makeStub(vi.fn().mockResolvedValue(undefined));
+    createTransportMock.mockReturnValueOnce(oldStub).mockReturnValue(staleAlphaStub);
+
+    const r = new TransportRegistry();
+    r.register(makeConfig('alpha'));
+
+    // The original omission was safe with one source. The reload adds a second
+    // source without an explicit default, so require_connection must now reject
+    // that same omitted request instead of silently pinning it to old alpha.
+    const inflight = r.get();
+    r.replaceAll([makeConfig('alpha'), makeConfig('beta')]);
+    rejectOldInit(new Error('obsolete connect timeout'));
+
+    await expect(inflight).rejects.toThrow(
+      /connectionName is required when multiple servers are configured: alpha, beta/,
+    );
+    expect(oldStub.close).toHaveBeenCalledTimes(1);
+    expect(createTransportMock).toHaveBeenCalledTimes(1);
+    expect(staleAlphaStub.init).not.toHaveBeenCalled();
   });
 
   it('retries the current config when a stale in-flight prepareConfig REJECTS after a reload', async () => {
