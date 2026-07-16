@@ -473,14 +473,12 @@ export class TransportRegistry {
    * set and `previousConfigs` is the pre-swap map (`snapshotState().configs`).
    */
   async closeChanged(previousConfigs: Map<string, ServerConfig>): Promise<void> {
-    // Bump the reload generation FIRST — exactly like closeAll — so any get()
-    // whose init() is still in flight (captured the old generation) discards a
-    // transport it dialed against now-stale params and re-resolves against the
-    // CURRENT config, instead of caching it after this returns. Unlike closeAll
-    // this does NOT close the transports of unchanged sources, so their live
-    // persistent connections (and any command running on them) survive.
-    this.reloadGeneration++;
-
+    // The reload generation was already bumped by replaceAll() (which committed
+    // the new configs before this runs), so an in-flight get() init that spans
+    // the swap already re-resolves against the CURRENT config. We must NOT bump
+    // again here or a single reload would count twice. Unlike closeAll this does
+    // NOT close the transports of unchanged sources, so their live persistent
+    // connections (and any command running on them) survive.
     const toClose: string[] = [];
     const candidates = new Set<string>([
       ...this.transports.keys(),
@@ -515,10 +513,13 @@ export class TransportRegistry {
   }
 
   /**
-   * Current monotonic reload generation (bumped by {@link closeAll}). Callers
-   * that captured a generation BEFORE an awaited operation (e.g. a manual
-   * approval prompt) compare against this AFTER the await to detect that a
-   * config hot-reload landed underneath them and revalidate accordingly.
+   * Current monotonic reload generation. Bumped in lockstep with EVERY change to
+   * which config is visible to a lazy {@link get}: {@link replaceAll} (forward
+   * swap), {@link restoreState} (rollback), and {@link closeAll} (teardown).
+   * Callers that captured a generation BEFORE an awaited operation (e.g. a
+   * manual approval prompt, or an in-flight init()) compare against this AFTER
+   * the await to detect that a config hot-reload landed underneath them and
+   * revalidate/re-resolve accordingly.
    */
   getReloadGeneration(): number {
     return this.reloadGeneration;
@@ -562,6 +563,14 @@ export class TransportRegistry {
     this.defaultExplicit = snap.defaultExplicit;
     this.requireConnectionWhenMulti = snap.requireConnectionWhenMulti;
     this.descriptionOverrides = new Map(snap.descriptionOverrides);
+    // Bump the reload generation here too. A failed reload transiently made the
+    // NEW config visible via replaceAll (which bumped) before this rollback
+    // reverts to the snapshot. That revert is itself a config-visibility change,
+    // so any in-flight init that started against the transiently-visible config
+    // must re-resolve against the restored config rather than cache a transport
+    // dialed against params the registry no longer serves. Same invariant as
+    // replaceAll/closeAll: invalidate in lockstep with every visibility change.
+    this.reloadGeneration++;
   }
 
   /**
@@ -616,5 +625,13 @@ export class TransportRegistry {
     this.defaultName = nextDefault;
     this.defaultExplicit = nextExplicit;
     this.descriptionOverrides = new Map();
+    // Bump the reload generation ATOMICALLY with making the new config visible.
+    // A lazy get() captures the generation before its init() awaits; invalidating
+    // here — in the same synchronous step that swaps `this.configs` — guarantees
+    // that any in-flight init spanning this swap re-resolves against the new
+    // config instead of caching a transport dialed against the old params. The
+    // downstream closeChanged() no longer bumps (it would double-count); closeAll
+    // and restoreState carry their own bump for the paths that don't call this.
+    this.reloadGeneration++;
   }
 }

@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { parseServerConfigJson, validateConfig } from '../src/index';
 
 // Unit tests for the multi-host (--ssh=<JSON>) config layer. Imported from
@@ -306,5 +308,73 @@ describe('validateConfig multi-host (finding 2: legacy flags must be rejected)',
 
   it('passes for a clean multi-host invocation (no legacy flags)', () => {
     expect(() => validateConfig({}, true)).not.toThrow();
+  });
+});
+
+describe('parseServerConfigJson (Codex 3591910736: keyPath ~ home expansion)', () => {
+  // A leading `~` / `~/` in keyPath must be expanded to the user's home dir at
+  // parse time — the same class the TOML loader already handles via expandHome.
+  // The openssh transport passes keyPath verbatim to `ssh -i`, and the ssh2
+  // transport reads it with fs.readFile; neither shell-expands `~`, so a stored
+  // literal `~/.ssh/id` resolves to a bogus relative path and auth fails.
+  it('expands a leading ~/ in keyPath to the home directory (openssh)', () => {
+    const cfg = parseServerConfigJson(JSON.stringify({
+      name: 'n', host: 'h', user: 'u', auth: 'key', transport: 'openssh', keyPath: '~/.ssh/id_ed25519',
+    }));
+    expect(cfg.keyPath).toBe(path.join(os.homedir(), '.ssh/id_ed25519'));
+    expect(cfg.keyPath!.startsWith('~')).toBe(false);
+  });
+
+  it('expands a bare ~ in keyPath to the home directory (ssh2)', () => {
+    const cfg = parseServerConfigJson(JSON.stringify({
+      name: 'n', host: 'h', user: 'u', auth: 'key', keyPath: '~',
+    }));
+    expect(cfg.keyPath).toBe(os.homedir());
+  });
+
+  it('leaves an absolute keyPath unchanged', () => {
+    const cfg = parseServerConfigJson(JSON.stringify({
+      name: 'n', host: 'h', user: 'u', auth: 'key', transport: 'openssh', keyPath: '/etc/ssh/id_ed25519',
+    }));
+    expect(cfg.keyPath).toBe('/etc/ssh/id_ed25519');
+  });
+});
+
+describe('parseServerConfigJson (Codex 3591910745: boolean/non-scalar port must be rejected)', () => {
+  // `Number(true) === 1` and `Number([22]) === 22`, so a boolean or single-
+  // element-array port would silently coerce to a valid TCP port. Only a real
+  // number or a numeric string is a legitimate port; every other JSON type
+  // must be rejected at parse time like the TOML loader does.
+  it('rejects a boolean port (true would coerce to 1)', () => {
+    expect(() => parseServerConfigJson(JSON.stringify({
+      name: 'n', host: 'h', user: 'u', auth: 'password', password: 'pw', port: true,
+    }))).toThrow(/invalid "port"/);
+    expect(() => parseServerConfigJson(JSON.stringify({
+      name: 'n', host: 'h', user: 'u', auth: 'password', password: 'pw', port: false,
+    }))).toThrow(/invalid "port"/);
+  });
+
+  it('rejects an array/object port (Number([22]) would coerce to 22)', () => {
+    expect(() => parseServerConfigJson(JSON.stringify({
+      name: 'n', host: 'h', user: 'u', auth: 'password', password: 'pw', port: [22],
+    }))).toThrow(/invalid "port"/);
+    expect(() => parseServerConfigJson(JSON.stringify({
+      name: 'n', host: 'h', user: 'u', auth: 'password', password: 'pw', port: {},
+    }))).toThrow(/invalid "port"/);
+  });
+
+  it('rejects a null port', () => {
+    expect(() => parseServerConfigJson(JSON.stringify({
+      name: 'n', host: 'h', user: 'u', auth: 'password', password: 'pw', port: null,
+    }))).toThrow(/invalid "port"/);
+  });
+
+  it('still accepts a numeric and numeric-string port (contract preserved)', () => {
+    expect(parseServerConfigJson(JSON.stringify({
+      name: 'n', host: 'h', user: 'u', auth: 'password', password: 'pw', port: 2222,
+    })).port).toBe(2222);
+    expect(parseServerConfigJson(JSON.stringify({
+      name: 'n', host: 'h', user: 'u', auth: 'password', password: 'pw', port: '2200',
+    })).port).toBe(2200);
   });
 });

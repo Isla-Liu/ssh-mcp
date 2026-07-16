@@ -748,3 +748,49 @@ describe('TransportRegistry.resolveProfileName (audit attribution, non-throwing)
     expect(r.resolveProfileName()).toBe('default');
   });
 });
+
+describe('TransportRegistry reload-generation atomicity (Codex 3591910741: invalidate-with-visibility)', () => {
+  // The reload race is a CLASS bug about ORDERING: any operation that changes
+  // which config is *visible* to a lazy get() must bump the reload generation
+  // in the SAME synchronous step, so an init() that is already in flight (it
+  // captured the pre-change generation in get()) discards the transport it
+  // dialed against the now-stale params and re-resolves against the current
+  // config. Deferring the bump to a later closeChanged()/closeAll() leaves a
+  // window — and the rollback path (restoreState after a failed swap) had no
+  // bump at all — where an in-flight init can cache a transport built from a
+  // config the registry no longer serves.
+
+  it('replaceAll bumps the reload generation atomically with the config swap (before closeChanged runs)', () => {
+    const r = new TransportRegistry();
+    r.register(makeConfig('alpha'));
+    const before = r.getReloadGeneration();
+
+    // Swap the visible source set. The NEW config is live immediately...
+    r.replaceAll([makeConfig('beta')]);
+    expect(r.names()).toEqual(['beta']);
+
+    // ...so the generation MUST already reflect the swap. If the bump is
+    // deferred to a later closeChanged(), an init() that captured `before`
+    // between replaceAll and closeChanged would cache a stale transport.
+    expect(r.getReloadGeneration()).toBe(before + 1);
+  });
+
+  it('restoreState bumps the reload generation so a rolled-back swap also invalidates in-flight inits', () => {
+    const r = new TransportRegistry();
+    r.register(makeConfig('alpha'));
+    const snap = r.snapshotState();
+
+    // A failed reload transiently makes the new config visible via replaceAll,
+    // then rolls back via restoreState (engine.reloadPolicy threw in between).
+    r.replaceAll([makeConfig('beta')]);
+    const afterSwap = r.getReloadGeneration();
+
+    r.restoreState(snap);
+    expect(r.names()).toEqual(['alpha']); // config rolled back to the snapshot
+
+    // The rollback changed the visible config back, so it too must invalidate:
+    // an init() started against the transiently-visible `beta` params must not
+    // cache after the registry has reverted to `alpha`.
+    expect(r.getReloadGeneration()).toBe(afterSwap + 1);
+  });
+});

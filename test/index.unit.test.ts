@@ -369,6 +369,22 @@ describe('buildTransportConfig (finding 2: no unconditional key read for passwor
     expect(cfg.keyPath).toBe('/nonexistent/path/to/key');
     expect(cfg.privateKey).toBeUndefined();
   });
+
+  it('expands a leading ~/ in the legacy --key path (Codex 3591910736 sibling, openssh)', async () => {
+    // Same keyPath ~ expansion class as the multi-host JSON path: a legacy
+    // single-host --key=~/.ssh/id must resolve to the home dir, not a literal
+    // relative "~/.ssh/id" that ssh -i / fs.readFile can't find.
+    const cfg = await buildTransportConfig({
+      host: 'h',
+      port: 22,
+      username: 'u',
+      key: '~/.ssh/id_ed25519',
+      transportFlag: 'openssh',
+    });
+    expect(cfg.transport).toBe('openssh');
+    expect(cfg.keyPath).toBe(path.join(os.homedir(), '.ssh/id_ed25519'));
+    expect(cfg.keyPath!.startsWith('~')).toBe(false);
+  });
 });
 
 describe('approval command/context helpers', () => {
