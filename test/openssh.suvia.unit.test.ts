@@ -118,6 +118,62 @@ describe('OpenSSH command sentinels', () => {
       stderr: 'Permission denied\n',
     });
   });
+
+  it('classifies a handshake close before the sentinel as connect and never usable', async () => {
+    const fc = new FakeChild();
+    spawnMock.mockReturnValue(fc);
+    const t = new OpenSshTransport({ host: 'h', port: 22, username: 'u' });
+    const p = t.exec('true', { timeoutMs: 60000 });
+
+    fc.stderr.emit('data', Buffer.from(
+      'kex_exchange_identification: Connection closed by remote host\n',
+    ));
+    // Node reports process exit before stdio close. Neither event proves that
+    // the remote command started; only the absent sentinel is authoritative.
+    fc.emit('exit', 255, null);
+    fc.emit('close', 255, null);
+
+    await expect(p).resolves.toMatchObject({ exitCode: 255, category: 'connect' });
+    expect(t.isConnected()).toBe(false);
+  });
+
+  it('classifies an unmatched pre-sentinel process exit as transport, not remote_exit', async () => {
+    const fc = new FakeChild();
+    spawnMock.mockReturnValue(fc);
+    const t = new OpenSshTransport({ host: 'h', port: 22, username: 'u' });
+    const p = t.exec('true', { timeoutMs: 60000 });
+
+    fc.stderr.emit('data', Buffer.from('unexpected ssh client failure\n'));
+    fc.emit('exit', 1, null);
+    fc.emit('close', 1, null);
+
+    await expect(p).resolves.toMatchObject({ exitCode: 1, category: 'transport' });
+    expect(t.isConnected()).toBe(false);
+  });
+
+  it.each(['error-before-close', 'close-before-error'] as const)(
+    'settles a spawn-error lifecycle deterministically when events arrive %s',
+    async (ordering) => {
+      const fc = new FakeChild();
+      spawnMock.mockReturnValue(fc);
+      const t = new OpenSshTransport({ host: 'h', port: 22, username: 'u' });
+      const p = t.exec('true', { timeoutMs: 60000 });
+      const spawnError = new Error('spawn ssh ENOENT');
+
+      if (ordering === 'error-before-close') {
+        fc.emit('error', spawnError);
+        fc.emit('close', null, null);
+      } else {
+        fc.emit('close', null, null);
+        fc.emit('error', spawnError);
+      }
+
+      const result = await p;
+      expect(result.category).toBe('transport');
+      expect(result.category).not.toBe('remote_exit');
+      expect(t.isConnected()).toBe(false);
+    },
+  );
 });
 
 describe('runSuViaPty overall deadline (finding 4: timeoutMs is the hard ceiling)', () => {
