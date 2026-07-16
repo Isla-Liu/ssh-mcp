@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { McpError } from '@modelcontextprotocol/sdk/types.js';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
@@ -1182,33 +1182,90 @@ describe('approveTransportForCurrentConfig (Codex V4 finding: re-run approval af
     expect(result.approval.reason).toBe('decision-2');
   });
 
-  it('retries against the CURRENT profile when a stale pre-reload denial throws', async () => {
+  it('preserves a denial when reload completes during the gate instead of retrying under a looser policy', async () => {
     let generation = 1;
-    const fresh = stub('post-reload');
     const approvedProfiles: string[] = [];
+    const get = vi.fn(async () => stub('must-not-run'));
     const reg = {
       getReloadGeneration: () => generation,
-      get: async (_name?: string) => fresh,
+      get,
       profile: (_name?: string) => ({ id: generation === 1 ? 'old-profile' : 'new-profile' } as any),
+    };
+
+    await expect(approveTransportForCurrentConfig({
+      reg: reg as any,
+      profile: reg.profile('alpha') as any,
+      gate: async (profile) => {
+        approvedProfiles.push(profile.id);
+        generation = 2;
+        throw new Error('operator denied this execution identity');
+      },
+    })).rejects.toThrow(/operator denied/);
+
+    expect(approvedProfiles).toEqual(['old-profile']);
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['smart-gate error', new Error('smart approval backend failed closed')],
+    ['manual cancellation', Object.assign(new Error('approval cancelled'), { name: 'AbortError' })],
+    ['approval timeout', Object.assign(new Error('approval timed out'), { name: 'TimeoutError' })],
+  ])('preserves a %s across a concurrent reload', async (_label, gateError) => {
+    let generation = 1;
+    const get = vi.fn(async () => stub('must-not-run'));
+    const gate = vi.fn(async () => {
+      generation = 2;
+      throw gateError;
+    });
+    const reg = {
+      getReloadGeneration: () => generation,
+      get,
+      profile: (_name?: string) => ({ id: 'alpha' } as any),
+    };
+
+    await expect(approveTransportForCurrentConfig({
+      reg: reg as any,
+      profile: reg.profile('alpha') as any,
+      gate,
+    })).rejects.toBe(gateError);
+    expect(gate).toHaveBeenCalledTimes(1);
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it('samples the authoritative profile inside the generation used for approval and execution', async () => {
+    let generation = 1;
+    let generationReads = 0;
+    const seenPolicies: string[] = [];
+    const fresh = stub('generation-3-transport');
+    const reg = {
+      getReloadGeneration: () => {
+        generationReads += 1;
+        // The prior implementation refreshed the profile at generation 2,
+        // then sampled generation 3 at the top of the next attempt and gated
+        // the stale generation-2 policy as if it were authoritative.
+        if (generationReads === 3) generation = 3;
+        return generation;
+      },
+      get: async (_name?: string) => fresh,
+      profile: (_name?: string) => ({
+        id: 'alpha',
+        description: `policy-generation-${generation}`,
+      } as any),
     };
 
     const result = await approveTransportForCurrentConfig({
       reg: reg as any,
       profile: reg.profile('alpha') as any,
       gate: async (profile) => {
-        approvedProfiles.push(profile.id);
-        if (approvedProfiles.length === 1) {
-          generation = 2;
-          throw new Error('approval denied by stale profile');
-        }
-        return allow('current decision');
+        seenPolicies.push(profile.description!);
+        if (seenPolicies.length === 1) generation = 2;
+        return allow(`allowed-${profile.description}`);
       },
     });
 
-    expect(approvedProfiles).toEqual(['old-profile', 'new-profile']);
+    expect(seenPolicies).toEqual(['policy-generation-1', 'policy-generation-3']);
     expect(result.transport).toBe(fresh);
-    expect(result.profile).toBe('new-profile');
-    expect(result.approval.reason).toBe('current decision');
+    expect(result.approval.reason).toBe('allowed-policy-generation-3');
   });
 
   it('preserves a real denial when no reload changed the generation', async () => {

@@ -816,11 +816,13 @@ export async function reacquireTransportIfReloaded(
 /**
  * Approve and acquire one stable source across config reloads.
  *
- * The canonical source id is sampled before the first await. Every attempt gates
- * that source before registry.get() can initialize/elevate a transport. If a
- * reload lands during either await, the decision/transport is discarded and the
- * same source id is re-profiled and re-approved; it is never reinterpreted as a
- * new default.
+ * The canonical source id is sampled before the first await. Every attempt
+ * samples its approval profile inside one stable reload generation, then gates
+ * that source before registry.get() can initialize/elevate a transport. A stale
+ * allow or transport is discarded and retried against the same source id. Gate
+ * rejections (denial, timeout, cancellation, backend error) are always terminal:
+ * a concurrent reload must never turn a fail-closed decision into a retry under
+ * a potentially looser policy.
  */
 export async function approveTransportForCurrentConfig(params: {
   reg: Pick<TransportRegistry, 'getReloadGeneration' | 'get' | 'profile'>;
@@ -828,27 +830,23 @@ export async function approveTransportForCurrentConfig(params: {
   gate: (profile: ResolvedSource) => Promise<ApprovalDecision>;
   maxAttempts?: number;
 }): Promise<{ transport: ISshTransport; profile: string; approval: ApprovalDecision }> {
-  let effectiveProfile = params.profile;
   const resolvedName = params.profile.id;
   const maxAttempts = params.maxAttempts ?? 10;
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const generationBeforeApproval = params.reg.getReloadGeneration();
-    let approval: ApprovalDecision;
-    try {
-      approval = await params.gate(effectiveProfile);
-    } catch (err) {
-      if (params.reg.getReloadGeneration() === generationBeforeApproval) {
-        throw err;
-      }
-      // The old denial/timeout was invalidated by reload. Re-profile the SAME
-      // canonical source before retrying; a removed source fails closed here.
-      effectiveProfile = params.reg.profile(resolvedName);
+    const effectiveProfile = params.reg.profile(resolvedName);
+    // profile() and generation reads are synchronous, but keeping both reads
+    // makes the identity/generation pairing explicit and testable even for a
+    // registry seam that changes generation during profile resolution.
+    if (params.reg.getReloadGeneration() !== generationBeforeApproval) {
       continue;
     }
+    // Never catch/retry a gate rejection. The error is the authoritative result
+    // for this execution identity even if reload completes while it is pending.
+    const approval = await params.gate(effectiveProfile);
 
     if (params.reg.getReloadGeneration() !== generationBeforeApproval) {
-      effectiveProfile = params.reg.profile(resolvedName);
       continue;
     }
 
@@ -875,7 +873,6 @@ export async function approveTransportForCurrentConfig(params: {
     // A reload landed while get() was initializing. Registry.get() already
     // discarded/retried stale transport state; loop to authorize the current
     // transport configuration before execution.
-    effectiveProfile = params.reg.profile(resolvedName);
   }
 
   throw new Error(`config reloaded ${maxAttempts} times during approval; retry command after reloads settle`);
