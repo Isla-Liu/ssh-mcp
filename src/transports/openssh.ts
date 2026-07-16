@@ -437,7 +437,10 @@ exit 0`;
     const pwRe = /(?:^|\r?\n|[^\w])[Pp]assword(?:\s+for\s+\S+)?:\s*$/m;
     const failRe = /(authentication failure|incorrect password|su: (?:failed|Authentication failure|incorrect))/i;
     const readyRe = new RegExp(`${readyMark}`);
-    const endRe = new RegExp(`${endMark}(\\d{1,3})(?:\\r?\\n|$)`);
+    // This regex runs on every PTY data chunk, not only after process close.
+    // Requiring the protocol's newline prevents a chunk ending after the first
+    // digit of (for example) exit 12 from being accepted prematurely as exit 1.
+    const endRe = new RegExp(`${endMark}(\\d{1,3})\\r?\\n`);
 
     return new Promise((resolve) => {
       const args = [...this.buildArgs({ ...opts, pty: true }), 'su -'];
