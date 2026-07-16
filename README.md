@@ -192,6 +192,14 @@ For more information about MCP in Claude Code, see the [official documentation](
 
 > Experimental. Backwards-compatible: unchanged when `--transport` and `--kerberos` are both omitted.
 
+> **POSIX target shell required.** The OpenSSH subprocess transport wraps each
+> command with POSIX `sh` syntax to preserve the remote exit status reliably.
+> It therefore supports Linux/Unix targets whose SSH login shell is
+> POSIX-compatible, including a Windows OpenSSH *client* connecting to Linux.
+> A Windows OpenSSH server whose login shell is PowerShell or `cmd.exe` is not a
+> supported target for this transport; use the default `ssh2` transport for
+> Windows targets instead.
+
 The default `ssh2`-based transport does not implement GSSAPI/Kerberos authentication (upstream issue [mscdex/ssh2#333](https://github.com/mscdex/ssh2/issues/333), open since 2015). When an **opt-in** OpenSSH subprocess transport is selected, the server delegates SSH to the operating system's `ssh` binary, which supports:
 
 - Kerberos SSO via GSSAPI (`-o GSSAPIAuthentication=yes`)
@@ -259,6 +267,13 @@ npx -y ssh-mcp -- \
 
 ### Caveats and limitations
 
+- **POSIX remote login shell only.** `--transport=openssh` uses a POSIX
+  subshell/sentinel protocol for command status and its sudo/su flows also
+  require standard Unix utilities. PowerShell and `cmd.exe` target shells are
+  explicitly remain outside this transport's supported contract rather than
+  being treated as compatible. Windows remains supported as the local
+  OpenSSH/Kerberos client, and as a remote target through the default `ssh2`
+  transport.
 - **No connection multiplexing on Windows.** Win32-OpenSSH does not support `ControlMaster` ([issue #1328](https://github.com/PowerShell/Win32-OpenSSH/issues/1328)). Each `exec` call spawns a fresh `ssh.exe` and performs a full Kerberos AP-REQ round trip. Expect ~100–300 ms extra latency per invocation on Windows. Linux/macOS may work around this with user-provided `ssh_config` `ControlMaster` settings — the transport does not configure multiplexing itself.
 - **Password mode via `SSH_ASKPASS`.** When `--password` is combined with `--transport=openssh`, the server writes a short-lived askpass helper to `%TEMP%/ssh-mcp-<pid>/` and exports the password through a per-process environment variable. The password never appears in `argv` but is briefly visible to same-user-session process inspection. Prefer Kerberos or key auth.
 - **`--suPassword` over OpenSSH transport** is implemented via `ssh -tt` with a local expect-style state machine (random-nonce sentinel prompts). Works, but has more moving parts than the ssh2 path. Report issues with stderr output if you hit a regression.
