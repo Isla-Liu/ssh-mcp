@@ -326,6 +326,24 @@ describe('runSuViaPty echo stripping (finding 1: strip echoed PTY input from su 
     expect(res.stdout).not.toContain('echo ');
   });
 
+  it('waits for the sentinel newline before accepting a multi-digit exit split across PTY chunks', async () => {
+    const fc = new FakeChild();
+    spawnMock.mockReturnValue(fc);
+    const t = new OpenSshTransport({ host: 'h', port: 22, username: 'u', suPassword: 'pw' });
+
+    const p = (t as any).runSuViaPty('exit 12', 'pw', { timeoutMs: 60000 }) as Promise<any>;
+    const { endMark } = driveToExec(fc);
+
+    // PTY data chunk boundaries are arbitrary. The first chunk ends after the
+    // first digit, so a parser that treats end-of-current-buffer as the end of
+    // the sentinel reports 1 and ignores the following 2.
+    emit(fc, `${endMark}1`);
+    emit(fc, '2\r\n');
+    fc.emit('close', 0, null);
+
+    await expect(p).resolves.toMatchObject({ exitCode: 12, category: 'remote_exit' });
+  });
+
   it('isolates su-path shell syntax errors so the root control shell still emits its sentinel', async () => {
     const fc = new FakeChild();
     spawnMock.mockReturnValue(fc);
