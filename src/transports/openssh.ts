@@ -558,20 +558,13 @@ exit 0`;
           state = 'EXEC';
           buffer = '';
           stdoutTail = '';
-          // Run the user command inside a subshell, then echo the sentinel and
-          // its exit status. Newlines are intentional: a trailing shell comment
-          // (including the MCP description suffix) cannot consume the closing
-          // subshell or sentinel command.
-          //
-          //  - Subshell isolation: a command that exits or exec-replaces its
-          //    shell (e.g. `echo ok; exit 0`, `exec true`) only terminates the
-          //    subshell. The root control shell survives to run the sentinel, so
-          //    the real exit status is reported instead of the close path
-          //    mistaking a clean exit for a transport failure and dropping the
-          //    output. `$?` after `( ... )` is the subshell's exit status.
-          execInput = `(
-${command}
-)
+          // Treat the user text as data for an inner POSIX shell, exactly like
+          // runSsh. Raw interpolation would let an unmatched quote/comment turn
+          // into syntax for the long-lived root control shell, suppressing the
+          // sentinel and hanging until timeout. The inner shell also contains
+          // exit/exec, so the root shell always survives to report its status.
+          const escapedCommand = command.replace(/'/g, "'\\''");
+          execInput = `sh -c '${escapedCommand}'
 echo ${endMark}$?`;
           writeLine(execInput);
           return;

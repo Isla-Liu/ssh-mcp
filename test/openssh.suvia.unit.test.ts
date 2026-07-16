@@ -85,7 +85,7 @@ describe('runSuViaPty large output (finding 3: no ~4KB truncation)', () => {
 });
 
 describe('OpenSSH command sentinels', () => {
-  it('puts the su closing subshell and sentinel after a command comment', async () => {
+  it('keeps the su sentinel outside an inner command ending in a comment', async () => {
     const fc = new FakeChild();
     spawnMock.mockReturnValue(fc);
     const t = new OpenSshTransport({ host: 'h', port: 22, username: 'u', suPassword: 'pw' });
@@ -93,7 +93,7 @@ describe('OpenSSH command sentinels', () => {
 
     const { endMark } = driveToExec(fc);
     const execInput = fc.writes.at(-1)!;
-    expect(execInput).toContain('echo ok # described command\n)\necho ' + endMark);
+    expect(execInput).toContain("sh -c 'echo ok # described command'\necho " + endMark + '$?');
     emit(fc, execInput.replace(/\n$/, '') + '\n' + 'ok\n' + endMark + '0\n');
     fc.emit('close', 0, null);
 
@@ -274,7 +274,7 @@ describe('runSuViaPty echo stripping (finding 1: strip echoed PTY input from su 
     expect(res.stdout).not.toContain(`echo ${endMark}`);
   });
 
-  it('wraps the user command in a subshell so its own exit does not kill the sentinel (P2)', async () => {
+  it('runs the user command in an inner shell so its own exit does not kill the sentinel (P2)', async () => {
     const fc = new FakeChild();
     spawnMock.mockReturnValue(fc);
     const t = new OpenSshTransport({ host: 'h', port: 22, username: 'u', suPassword: 'pw' });
@@ -283,12 +283,12 @@ describe('runSuViaPty echo stripping (finding 1: strip echoed PTY input from su 
 
     const { endMark } = driveToExec(fc);
 
-    // The EXEC input written to the root shell must run the command in a
-    // subshell `( ... )` so a command that exits/exec-replaces its shell only
-    // terminates the subshell; the control shell survives to emit the sentinel.
+    // The EXEC input written to the root shell must run the command as data for
+    // an inner shell so exit/exec only terminates that shell; the root control
+    // shell survives to emit the sentinel.
     const execInput = fc.writes.find((w) => w.includes(endMark) && w.includes('echo'));
     expect(execInput).toBeDefined();
-    expect(execInput!.trim()).toBe(`(\necho ok; exit 0\n)\necho ${endMark}$?`);
+    expect(execInput!.trim()).toBe(`sh -c 'echo ok; exit 0'\necho ${endMark}$?`);
 
     emit(fc, execInput!.replace(/\n$/, '') + '\r\n');
     emit(fc, 'ok\n');
@@ -324,6 +324,24 @@ describe('runSuViaPty echo stripping (finding 1: strip echoed PTY input from su 
     expect(res.stdout).toBe('foo');
     expect(res.stdout).not.toContain(endMark);
     expect(res.stdout).not.toContain('echo ');
+  });
+
+  it('isolates su-path shell syntax errors so the root control shell still emits its sentinel', async () => {
+    const fc = new FakeChild();
+    spawnMock.mockReturnValue(fc);
+    const t = new OpenSshTransport({ host: 'h', port: 22, username: 'u', suPassword: 'pw' });
+    const pending = (t as any).runSuViaPty("printf 'unterminated", 'pw', { timeoutMs: 60000 }) as Promise<any>;
+
+    const { endMark } = driveToExec(fc);
+    const execInput = fc.writes.find((line) => line.includes(endMark) && !line.includes('export PS1='));
+    if (!execInput) throw new Error('exec input not written: ' + JSON.stringify(fc.writes));
+    const { spawnSync } = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const local = spawnSync('/bin/sh', ['-c', execInput], { encoding: 'utf8' });
+    if (local.stdout) emit(fc, local.stdout);
+    if (local.stderr) emit(fc, local.stderr);
+    fc.emit('close', local.status, local.signal);
+
+    await expect(pending).resolves.toMatchObject({ exitCode: 2, category: 'remote_exit' });
   });
 });
 
